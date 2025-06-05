@@ -1,0 +1,2902 @@
+import bpy
+from bpy.props import (
+    PointerProperty, StringProperty, FloatProperty,
+    IntProperty, BoolProperty, EnumProperty, FloatVectorProperty
+)
+from bpy.types import Operator, Panel, PropertyGroup
+import math
+from mathutils import Vector
+import random
+from bpy_extras.object_utils import world_to_camera_view # For camera trimming
+
+# --- START OF FILE Rogue Perspective AI Mixed.txt ---
+
+bl_info = {
+    "name": "Rogue Perspective AI",
+    "author": "Your Name & Gemini & Copilot",
+    "version": (0, 4, 7), # Incremented version for this fix
+    "blender": (4, 0, 0),
+    "location": "View3D > Sidebar > RogueAI",
+    "description": "Assists with creating perspective curve guides. (VP persistence, 1P Z-freedom, stability attempts)",
+    "warning": "If crashes occur on mode switch, check console for errors.",
+    "doc_url": "",
+    "category": "3D View",
+}
+
+# ... (Keep all your existing Global Variables, Utility Functions, Callbacks, Properties, etc. from line 18 down to line 548)
+# Global Variables / Constants
+# -----------------------------------------------------------
+PERSPECTIVE_HELPER_COLLECTION = "Perspective_Helpers_Collection"
+PERSPECTIVE_GUIDES_COLLECTION = "Perspective_Guides_Curves_Collection"
+HORIZON_CTRL_OBJ_NAME = "CTRL_Perspective_Horizon"
+HORIZON_CURVE_OBJ_NAME = "VISUAL_Horizon_Line"
+VP_PREFIX = "VP_"
+DEFAULT_LINE_EXTENSION = 100.0
+
+VP_TYPE_SPECIFIC_PREFIX_MAP = {
+    'ONE_POINT': VP_PREFIX + "1P",
+    'TWO_POINT': VP_PREFIX + "2P",
+    'THREE_POINT_H': VP_PREFIX + "3P_H",
+    'THREE_POINT_V': VP_PREFIX + "3P_V",
+    'FISH_EYE': VP_PREFIX + "FE_Center" # Note: Used as base, often with _1 or specific name
+}
+previous_perspective_type_on_switch = 'NONE'
+
+# -----------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------
+def get_helpers_collection(context):
+    if PERSPECTIVE_HELPER_COLLECTION not in bpy.data.collections:
+        coll = bpy.data.collections.new(PERSPECTIVE_HELPER_COLLECTION)
+        context.scene.collection.children.link(coll)
+    return bpy.data.collections[PERSPECTIVE_HELPER_COLLECTION]
+
+def get_guides_collection(context):
+    if PERSPECTIVE_GUIDES_COLLECTION not in bpy.data.collections:
+        coll = bpy.data.collections.new(PERSPECTIVE_GUIDES_COLLECTION)
+        context.scene.collection.children.link(coll)
+    return bpy.data.collections[PERSPECTIVE_GUIDES_COLLECTION]
+
+def get_horizon_control_object():
+    return bpy.data.objects.get(HORIZON_CTRL_OBJ_NAME)
+
+def get_horizon_curve_object():
+    return bpy.data.objects.get(HORIZON_CURVE_OBJ_NAME)
+
+def get_vanishing_points(specific_prefix_key=None):
+    vps = []
+    if PERSPECTIVE_HELPER_COLLECTION not in bpy.data.collections:
+        return []
+    helpers_coll = bpy.data.collections[PERSPECTIVE_HELPER_COLLECTION]
+    target_prefix = None
+    if specific_prefix_key and specific_prefix_key in VP_TYPE_SPECIFIC_PREFIX_MAP:
+        target_prefix = VP_TYPE_SPECIFIC_PREFIX_MAP[specific_prefix_key]
+
+    for obj in helpers_coll.objects:
+        if obj.type == 'EMPTY' and obj.name.startswith(VP_PREFIX): # General VP_ check
+            if target_prefix: # If a specific type is requested
+                if obj.name.startswith(target_prefix): # Check if obj name starts with specific type's prefix
+                    vps.append(obj)
+            else: # If no specific type, get all VPs
+                vps.append(obj)
+
+    # Sort VPs by name for consistent order, crucial for 2P/3P auto-assignment if names aren't exact _1, _2
+    vps.sort(key=lambda vp_obj: vp_obj.name)
+    return vps
+
+
+def update_material_color_and_opacity(material, new_color_rgb, new_opacity):
+    if material and material.node_tree:
+        mix_shader_node = next((n for n in material.node_tree.nodes if n.type == 'ShaderNodeMixShader'), None)
+        emission_node = next((n for n in material.node_tree.nodes if n.type == 'ShaderNodeEmission'), None)
+        if emission_node:
+            emission_node.inputs['Color'].default_value = list(new_color_rgb) + [1.0] # RGBA for emission color
+        if mix_shader_node:
+            mix_shader_node.inputs[0].default_value = new_opacity # Factor for mix shader
+        material.diffuse_color = tuple(list(new_color_rgb) + [new_opacity]) # For viewport display (solid mode)
+        return True
+    return False
+
+def create_curve_object(context, name, points_data_list, collection,
+                        bevel_depth=0.01, opacity=1.0, color_rgb=None, # MODIFIED: Added optional color_rgb=None
+                        is_cyclic=False, curve_type='POLY'):
+    # Remove existing object and its curve data if it's the only user
+    if name in bpy.data.objects:
+        old_obj = bpy.data.objects[name]
+        if old_obj.data and old_obj.data.name in bpy.data.curves and old_obj.data.users <= 1:
+            bpy.data.curves.remove(old_obj.data)
+        try:
+            bpy.data.objects.remove(old_obj, do_unlink=True)
+        except ReferenceError:
+            pass 
+
+    curve_data = bpy.data.curves.new(name=f"{name}_Data", type='CURVE')
+    curve_data.dimensions = '3D'
+    curve_data.bevel_depth = bevel_depth
+    curve_data.bevel_resolution = 1 
+    splines_created_count = 0
+
+    for spline_pts in points_data_list:
+        if not spline_pts: continue
+        if curve_type == 'POLY' and len(spline_pts) < 2: continue
+        if curve_type == 'BEZIER' and not spline_pts: continue
+
+        spline = curve_data.splines.new(type=curve_type)
+        if curve_type == 'POLY':
+            spline.points.add(len(spline_pts) - 1)
+            for idx, pt_co in enumerate(spline_pts):
+                spline.points[idx].co = list(pt_co) + [1.0] 
+        elif curve_type == 'BEZIER':
+            spline.bezier_points.add(len(spline_pts) -1 if spline_pts else 0)
+            for idx, pt_co in enumerate(spline_pts):
+                bp = spline.bezier_points[idx]
+                bp.co = pt_co
+                bp.handle_left_type = 'AUTO'
+                bp.handle_right_type = 'AUTO'
+        
+        if spline_pts : 
+            spline.use_cyclic_u = is_cyclic and (len(spline_pts) > 1)
+        splines_created_count += 1
+
+    if splines_created_count == 0: 
+        if curve_data.name in bpy.data.curves:
+            bpy.data.curves.remove(curve_data)
+        return None
+
+    curve_obj = bpy.data.objects.new(name, curve_data)
+    
+    # MODIFIED: Determine color to use
+    final_color_rgb = color_rgb if color_rgb is not None else \
+                      (random.uniform(0.1, 1.0), random.uniform(0.1, 1.0), random.uniform(0.1, 1.0))
+
+    mat_name = f"MAT_{name.replace(':', '_').replace(' ', '_')}" 
+    mat = bpy.data.materials.get(mat_name)
+    if not mat:
+        mat = bpy.data.materials.new(name=mat_name)
+        mat.use_nodes = True
+        if mat.node_tree:
+            mat.node_tree.nodes.clear()
+            output_node = mat.node_tree.nodes.new(type='ShaderNodeOutputMaterial')
+            transparent_node = mat.node_tree.nodes.new(type='ShaderNodeBsdfTransparent')
+            emission_node = mat.node_tree.nodes.new(type='ShaderNodeEmission')
+            mix_shader_node = mat.node_tree.nodes.new(type='ShaderNodeMixShader')
+
+            emission_node.inputs['Color'].default_value = list(final_color_rgb) + [1.0] # MODIFIED to use final_color_rgb
+            emission_node.inputs['Strength'].default_value = 3.0 
+            mix_shader_node.inputs[0].default_value = opacity 
+
+            mat.node_tree.links.new(transparent_node.outputs['BSDF'], mix_shader_node.inputs[1])
+            mat.node_tree.links.new(emission_node.outputs['Emission'], mix_shader_node.inputs[2])
+            mat.node_tree.links.new(mix_shader_node.outputs['Shader'], output_node.inputs['Surface'])
+
+        mat.blend_method = 'BLEND' 
+        if hasattr(mat, "shadow_method"): mat.shadow_method = 'NONE'
+        mat.diffuse_color = tuple(list(final_color_rgb) + [opacity]) # MODIFIED to use final_color_rgb
+    else: 
+        update_material_color_and_opacity(mat, final_color_rgb, opacity) # MODIFIED to use final_color_rgb
+
+    if curve_obj.data.materials: 
+        curve_obj.data.materials[0] = mat
+    else:
+        curve_obj.data.materials.append(mat)
+
+    target_collection = collection if collection else get_guides_collection(context)
+    target_collection.objects.link(curve_obj)
+    return curve_obj
+
+def clear_guides_with_prefix(context, prefix_list):
+    guides_coll = get_guides_collection(context) # Ensures collection exists
+    removed_count = 0
+    for obj in list(guides_coll.objects): # Iterate over a copy for safe removal
+        for prefix in prefix_list:
+            if obj.name.startswith(prefix):
+                try:
+                    if obj.data and obj.data.name in bpy.data.curves and obj.data.users <= 1:
+                        bpy.data.curves.remove(obj.data)
+                except ReferenceError: pass
+                except Exception as e: print(f"Error removing curve data for {obj.name}: {e}")
+                try:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                    removed_count += 1
+                except ReferenceError: pass
+                except Exception as e: print(f"Error removing object {obj.name}: {e}")
+                break 
+    return removed_count
+
+def generate_radial_lines_in_plane(vp_loc, density, line_extension, plane='XZ'):
+    lines = []
+    if density <= 0: return lines
+    for i in range(density):
+        angle = 2 * math.pi * i / density
+        if plane == 'XY': dir_vec = Vector((math.cos(angle), math.sin(angle), 0))
+        elif plane == 'XZ': dir_vec = Vector((math.cos(angle), 0, math.sin(angle)))
+        elif plane == 'YZ': dir_vec = Vector((0, math.cos(angle), math.sin(angle)))
+        else: dir_vec = Vector((math.cos(angle), math.sin(angle), 0)) # Fallback
+        dir_vec.normalize()
+        lines.append([vp_loc.copy(), vp_loc + dir_vec * line_extension])
+    return lines
+
+# -----------------------------------------------------------
+# Dynamic Horizon Line Update
+# -----------------------------------------------------------
+def update_dynamic_horizon_line_curve(context):
+    if not hasattr(context.scene, "perspective_tool_settings_splines"):
+        return
+    tool_settings = context.scene.perspective_tool_settings_splines
+    horizon_curve_obj = get_horizon_curve_object()
+    if not horizon_curve_obj:
+        return
+
+    current_type = tool_settings.current_perspective_type
+    points_world = []
+    # Hide by default – we'll unhide it when we set valid points.
+    horizon_curve_obj.hide_set(True)
+
+    if current_type == 'ONE_POINT':
+        vp1p = get_vanishing_points('ONE_POINT')
+        if vp1p:
+            z_level = vp1p[0].location.z
+            center_x = vp1p[0].location.x
+            center_y = vp1p[0].location.y
+        else:
+            # Fallback to horizon control if needed
+            horizon_ctrl = get_horizon_control_object()
+            if not horizon_ctrl:
+                return
+            z_level = horizon_ctrl.location.z
+            center_x, center_y = 0, 0
+        hz_len = tool_settings.horizon_line_length / 2.0
+        points_world = [
+            Vector((center_x - hz_len, center_y, z_level)),
+            Vector((center_x + hz_len, center_y, z_level))
+        ]
+        horizon_curve_obj.location = (0, 0, 0)
+        horizon_curve_obj.rotation_euler = (0, 0, 0)
+        # Explicitly unhide the horizon line for ONE_POINT mode.
+        horizon_curve_obj.hide_set(False)
+
+    elif current_type == 'TWO_POINT':
+        vps_2p = get_vanishing_points('TWO_POINT')
+        if len(vps_2p) >= 2:
+            points_world = [
+                vps_2p[0].location.copy(),
+                vps_2p[1].location.copy()
+            ]
+            horizon_curve_obj.location = Vector((0, 0, 0))
+            horizon_curve_obj.hide_set(False)
+
+    elif current_type == 'THREE_POINT': # Corrected from THREE_POINT to THREE_POINT_H as per get_vanishing_points usage
+        vps_3p_h = get_vanishing_points('THREE_POINT_H')
+        if len(vps_3p_h) >= 2:
+            points_world = [
+                vps_3p_h[0].location.copy(),
+                vps_3p_h[1].location.copy()
+            ]
+            horizon_curve_obj.location = Vector((0, 0, 0))
+            horizon_curve_obj.hide_set(False)
+
+    # Update the spline for the horizon line, if the data exists.
+    if horizon_curve_obj.data and horizon_curve_obj.data.splines:
+        if not horizon_curve_obj.data.splines: # Ensure spline exists
+             horizon_curve_obj.data.splines.new('POLY')
+
+        spline = horizon_curve_obj.data.splines[0]
+        if len(points_world) == 2:
+            if len(spline.points) != 2:
+                #spline.points.clear() # Not a valid method for SplinePoints
+                while len(spline.points) > 0:
+                    spline.points.remove(spline.points[0])
+                spline.points.add(1)   # Adding one point creates a total of 2 points.
+            spline.points[0].co = list(points_world[0]) + [1.0]
+            spline.points[1].co = list(points_world[1]) + [1.0]
+        else: # Default to origin if no valid points
+            if len(spline.points) != 2:
+                while len(spline.points) > 0:
+                    spline.points.remove(spline.points[0])
+                spline.points.add(1)
+            spline.points[0].co = (0, 0, 0, 1)
+            spline.points[1].co = (0, 0, 0, 1)
+
+    horizon_curve_obj.data.bevel_depth = tool_settings.horizon_line_thickness
+
+    h_color_rgb = list(tool_settings.horizon_line_color[:3])
+    h_opacity = tool_settings.horizon_line_color[3]
+    mat_to_update = None
+    if horizon_curve_obj.active_material:
+        mat_to_update = horizon_curve_obj.active_material
+    elif horizon_curve_obj.data.materials:
+        mat_to_update = horizon_curve_obj.data.materials[0]
+    if mat_to_update:
+        update_material_color_and_opacity(mat_to_update, h_color_rgb, h_opacity)
+
+
+# -----------------------------------------------------------
+# Property Update Callbacks
+# -----------------------------------------------------------
+def update_vp_empty_colors(self, context): # self is PerspectiveToolSettingsSplines
+    tool_settings = self
+    vps_1p = get_vanishing_points('ONE_POINT')
+    if vps_1p: vps_1p[0].color = list(tool_settings.one_point_vp_empty_color)
+
+    vps_2p = get_vanishing_points('TWO_POINT') # Already sorted by name
+    vp1_2p_target = VP_TYPE_SPECIFIC_PREFIX_MAP['TWO_POINT'] + "_1"
+    vp2_2p_target = VP_TYPE_SPECIFIC_PREFIX_MAP['TWO_POINT'] + "_2"
+    if len(vps_2p) > 0 and vps_2p[0].name.startswith(vp1_2p_target): vps_2p[0].color = list(tool_settings.two_point_vp1_empty_color)
+    elif len(vps_2p) > 0: vps_2p[0].color = list(tool_settings.two_point_vp1_empty_color) # Fallback for first
+    if len(vps_2p) > 1 and vps_2p[1].name.startswith(vp2_2p_target): vps_2p[1].color = list(tool_settings.two_point_vp2_empty_color)
+    elif len(vps_2p) > 1: vps_2p[1].color = list(tool_settings.two_point_vp2_empty_color) # Fallback for second
+
+
+    vps_3ph = get_vanishing_points('THREE_POINT_H') # Sorted
+    vp1_3ph_target = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_H'] + "_1"
+    vp2_3ph_target = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_H'] + "_2"
+    if len(vps_3ph) > 0 and vps_3ph[0].name.startswith(vp1_3ph_target): vps_3ph[0].color = list(tool_settings.three_point_vp_h1_empty_color)
+    elif len(vps_3ph) > 0: vps_3ph[0].color = list(tool_settings.three_point_vp_h1_empty_color)
+    if len(vps_3ph) > 1 and vps_3ph[1].name.startswith(vp2_3ph_target): vps_3ph[1].color = list(tool_settings.three_point_vp_h2_empty_color)
+    elif len(vps_3ph) > 1: vps_3ph[1].color = list(tool_settings.three_point_vp_h2_empty_color)
+
+    vps_3pv = get_vanishing_points('THREE_POINT_V') # Sorted
+    vp1_3pv_target = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_V'] + "_1"
+    if vps_3pv and vps_3pv[0].name.startswith(vp1_3pv_target) : vps_3pv[0].color = list(tool_settings.three_point_vp_v_empty_color)
+    elif vps_3pv : vps_3pv[0].color = list(tool_settings.three_point_vp_v_empty_color)
+
+    vps_fe = get_vanishing_points('FISH_EYE')
+    if vps_fe: # Should typically only be one for FE center
+        # Apply color to all found FE VPs, though usually there's just one primary.
+        for vp_fe in vps_fe:
+            vp_fe.color = list(tool_settings.fish_eye_vp_empty_color)
+
+
+    if context.area: context.area.tag_redraw()
+
+def update_guides_visuals_from_props(self, context): # self is PerspectiveToolSettingsSplines
+    tool_settings = self # self is PerspectiveToolSettingsSplines
+    guides_coll = get_guides_collection(context)
+    
+    # Opacity and thickness are still global
+    default_opacity = tool_settings.guide_curves_opacity
+    # Thickness is handled by create_curve_object's bevel_depth and operator generate functions reading guide_curves_thickness
+
+    for obj in guides_coll.objects:
+        if obj.type == 'CURVE' and obj.name != HORIZON_CURVE_OBJ_NAME:
+            if obj.data: # Update bevel depth (thickness)
+                obj.data.bevel_depth = tool_settings.guide_curves_thickness
+
+            mat = obj.active_material if obj.active_material else (obj.data.materials[0] if obj.data.materials else None)
+            if mat:
+                # Color is set randomly at creation, so we only update opacity here
+                # Retrieve the existing emission color to preserve it
+                emission_node = next((n for n in mat.node_tree.nodes if n.type == 'ShaderNodeEmission'), None)
+                if emission_node:
+                    existing_rgb_color = list(emission_node.inputs['Color'].default_value[:3])
+                    update_material_color_and_opacity(mat, existing_rgb_color, default_opacity)
+    if context.area: context.area.tag_redraw()
+
+def update_horizon_visuals_from_props(self, context):
+    update_dynamic_horizon_line_curve(context)
+
+def update_horizon_control_from_prop(self, context): # self is horizon_y_level property
+    horizon_ctrl = get_horizon_control_object()
+    if horizon_ctrl:
+        if abs(horizon_ctrl.location.z - self.horizon_y_level) > 0.001: # self here is PerspectiveToolSettingsSplines
+            horizon_ctrl.location.z = self.horizon_y_level
+    update_dynamic_horizon_line_curve(context)
+
+def switch_perspective_type_prop(self, context): # self is PerspectiveToolSettingsSplines
+    global previous_perspective_type_on_switch
+    tool_settings = self
+    current_new_type = tool_settings.current_perspective_type
+    print(f"Switching from '{previous_perspective_type_on_switch}' to '{current_new_type}'")
+
+    if previous_perspective_type_on_switch != 'NONE' and previous_perspective_type_on_switch != current_new_type:
+        print(f"  Clearing guides for previous type: {previous_perspective_type_on_switch}")
+        try:
+            bpy.ops.perspective_splines.clear_type_guides('EXEC_DEFAULT', type_filter_prop=previous_perspective_type_on_switch)
+        except Exception as e: print(f"  Error clearing guides for {previous_perspective_type_on_switch}: {e}")
+
+    try:
+        if current_new_type == 'ONE_POINT':
+            PERSPECTIVE_OT_generate_one_point_splines.create_default_one_point(context)
+        elif current_new_type == 'TWO_POINT':
+            # Directly call the class method responsible for creating/checking 2P VPs
+            PERSPECTIVE_OT_create_2p_vps_if_needed.create_default_two_point_vps(context) 
+        elif current_new_type == 'THREE_POINT':
+            PERSPECTIVE_OT_create_3p_vps_if_needed.create_default_three_point_vps(context) # NEW
+        elif current_new_type == 'FISH_EYE':
+            PERSPECTIVE_OT_generate_fish_eye_splines.create_default_fish_eye_center(context)
+    except Exception as e: print(f"  Error creating default VPs for {current_new_type}: {e}")
+    
+    try: update_vp_empty_colors(tool_settings, context)
+    except Exception as e: print(f"  Error updating VP colors: {e}")
+    try: update_dynamic_horizon_line_curve(context)
+    except Exception as e: print(f"  Error updating horizon line: {e}")
+
+    previous_perspective_type_on_switch = current_new_type
+    if context.area: context.area.tag_redraw()
+    print(f"Switch to {current_new_type} finished.")
+
+# -----------------------------------------------------------
+# Custom Properties
+# -----------------------------------------------------------
+
+class PerspectiveToolSettingsSplines(PropertyGroup):
+    horizon_y_level: FloatProperty(name="1P Horizon Z", default=0.0, update=update_horizon_control_from_prop, description="Z-level for the 1P horizon line control object")
+    horizon_line_length: FloatProperty(name="1P Horizon Length", default=200.0, min=1.0, update=update_horizon_visuals_from_props)
+    horizon_line_thickness: FloatProperty(name="Horizon Thickness", default=0.02, min=0.001, max=0.5, update=update_horizon_visuals_from_props)
+    horizon_line_color: FloatVectorProperty(name="Horizon Color", subtype='COLOR_GAMMA', size=4, default=(0.9, 0.9, 0.2, 1.0), min=0.0, max=1.0, update=update_horizon_visuals_from_props) # Horizon line keeps its color
+
+    guide_curves_thickness: FloatProperty(name="Guide Lines Thickness", default=0.01, min=0.001, max=0.5, update=update_guides_visuals_from_props)
+    guide_curves_opacity: FloatProperty(name="Guide Lines Opacity", default=0.8, min=0.0, max=1.0, subtype='FACTOR', update=update_guides_visuals_from_props)
+
+    # VP Empty colors (for the Empty objects themselves, not the lines)
+    one_point_vp_empty_color: FloatVectorProperty(name="1P VP Empty Color", subtype='COLOR', size=4, default=(1.0, 0.7, 0.2, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    two_point_vp1_empty_color: FloatVectorProperty(name="2P VP1 Empty Color", subtype='COLOR', size=4, default=(1.0, 0.4, 0.4, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    two_point_vp2_empty_color: FloatVectorProperty(name="2P VP2 Empty Color", subtype='COLOR', size=4, default=(0.4, 1.0, 0.4, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    three_point_vp_h1_empty_color: FloatVectorProperty(name="3P VP H1 Empty Color", subtype='COLOR', size=4, default=(1.0, 0.2, 0.2, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    three_point_vp_h2_empty_color: FloatVectorProperty(name="3P VP H2 Empty Color", subtype='COLOR', size=4, default=(0.2, 1.0, 0.2, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    three_point_vp_v_empty_color: FloatVectorProperty(name="3P VP V Empty Color", subtype='COLOR', size=4, default=(0.2, 0.2, 1.0, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+
+    # --- One Point ---
+    one_point_grid_density_radial: IntProperty(name="Radial Lines Density", default=16, min=2)
+    one_point_grid_density_ortho_x: IntProperty(name="Horiz. Parallels Density", default=7, min=0)
+    one_point_grid_density_ortho_y: IntProperty(name="Vert. Parallels Density", default=7, min=0)
+    one_point_draw_radial: BoolProperty(name="Draw Radial Lines", default=True) # This can stay if you have a single "Generate 1P" button
+    one_point_draw_ortho_x: BoolProperty(name="Draw Horiz. Parallels", default=True)
+    one_point_draw_ortho_y: BoolProperty(name="Draw Vert. Parallels", default=True)
+    one_point_grid_extent: FloatProperty(name="Ortho Grid Extent Factor", default=1.0, min=0.1)
+    one_point_line_extension: FloatProperty(name="Radial Line Length", default=DEFAULT_LINE_EXTENSION, min=1.0)
+
+    # --- Two Point ---
+    two_point_grid_density_vp1: IntProperty(name="VP1 Lines Density", default=10, min=1) # Renamed for clarity
+    two_point_grid_density_vp2: IntProperty(name="VP2 Lines Density", default=10, min=1) # Renamed
+    two_point_grid_density_vertical: IntProperty(name="Vertical Lines Density", default=9, min=0)
+    # two_point_draw_vp1, _vp2, _vertical can be removed if we have separate buttons for these
+    two_point_verticals_x_spacing_factor: FloatProperty(name="Verticals X Spacing Factor", default=1.0, min=0.1, max=5.0)
+    two_point_grid_height: FloatProperty(name="Vertical Line Height", default=20.0, min=0.1)
+    two_point_grid_depth_offset: FloatProperty(name="Verticals' Y Plane Offset", default=0.0)
+    two_point_line_extension: FloatProperty(name="Radial Line Length", default=200.0, min=1.0)
+
+    # --- Three Point ---
+    # three_point_draw_grid can be removed if we have separate buttons
+    three_point_line_extension: FloatProperty(name="Radial Line Length", default=200.0, min=1.0)
+    three_point_vp_h1_density: IntProperty(name="H1 Lines Density", default=8, min=1) # Renamed
+    three_point_vp_h2_density: IntProperty(name="H2 Lines Density", default=8, min=1) # Renamed
+    three_point_vp_v_density: IntProperty(name="V Lines Density", default=8, min=1)  # Renamed
+
+    # --- Fish Eye ---
+    fish_eye_vp_empty_color: FloatVectorProperty(name="FE VP Empty Color", subtype='COLOR', size=4, default=(0.5, 0.2, 0.8, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors) # New for FE VP
+    fish_eye_strength: FloatProperty(name="Distortion Strength", default=0.5, min=-1.0, max=1.0) # Currently unused in generation
+    fish_eye_grid_radial: IntProperty(name="Longitude Lines", default=16, min=3)
+    fish_eye_grid_concentric: IntProperty(name="Latitude Lines", default=8, min=1)
+    fish_eye_grid_radius: FloatProperty(name="Sphere Radius", default=15.0, min=0.1)
+    fish_eye_segments_per_curve: IntProperty(name="Curve Smoothness", default=24, min=4, max=64)
+    fish_eye_draw_latitude: BoolProperty(name="Draw Latitude Lines", default=True) # Defaulted to True as color is gone
+    fish_eye_horizontal_scale: FloatProperty(name="Fish Eye Horizontal Scale", default=1.0, min=0.1, max=5.0)
+
+    current_perspective_type: EnumProperty(
+        name="Perspective Mode",
+        items=[('NONE', "None", "No perspective guides active"),
+               ('ONE_POINT', "One Point", "One-point perspective"),
+               ('TWO_POINT', "Two Point", "Two-point perspective"),
+               ('THREE_POINT', "Three Point", "Three-point perspective"),
+               ('FISH_EYE', "Fish Eye", "Fisheye (spherical) perspective cage")],
+        default='NONE', update=switch_perspective_type_prop
+    )
+    camera_eye_height: FloatProperty(name="Camera Eye Height", default=1.6, min=0.1)
+    camera_distance: FloatProperty(name="Camera Distance from Target", default=15.0, min=1.0)
+
+    # --- Grid Creation Properties (New) ---
+    grid_active_plane: EnumProperty(
+        name="Active Grid Plane",
+        items=[('FRONT', "Front (YZ)", "Create grid on the YZ plane"),
+               ('BACK', "Back (YZ)", "Create grid on the YZ plane (offset for back)"),
+               ('TOP', "Top (XY)", "Create grid on the XY plane"),
+               ('BOTTOM', "Bottom (XY)", "Create grid on the XY plane (offset for bottom)"),
+               ('LEFT', "Left (XZ)", "Create grid on the XZ plane (offset for left)"),
+               ('RIGHT', "Right (XZ)", "Create grid on the XZ plane")],
+        default='FRONT'
+    )
+    grid_center: FloatVectorProperty(name="Grid Box Center", size=3, default=(0,0,0))
+    grid_size: FloatVectorProperty(name="Grid Box Size (X,Y,Z)", size=3, default=(10,10,10), min=0.1)
+    grid_subdivisions_u: IntProperty(name="Subdivisions U", default=10, min=1)
+    grid_subdivisions_v: IntProperty(name="Subdivisions V", default=10, min=1)
+    grid_draw_front: BoolProperty(name="Draw Front Grid", default=True)
+    grid_draw_back: BoolProperty(name="Draw Back Grid", default=False)
+    grid_draw_top: BoolProperty(name="Draw Top Grid", default=True)
+    grid_draw_bottom: BoolProperty(name="Draw Bottom Grid", default=False)
+    grid_draw_left: BoolProperty(name="Draw Left Grid", default=False)
+    grid_draw_right: BoolProperty(name="Draw Right Grid", default=False)
+
+    # --- Guide Visibility (New - simple version for now) ---
+    # This could be expanded to a CollectionProperty for more robust state tracking
+    # For now, operators will just toggle. UI can show buttons for main groups.
+
+    # --- Line Trimming Properties (New) ---
+    trim_margin: FloatProperty(name="Trim Margin (0-1)", default=0.05, min=0.0, max=0.5, description="Margin outside camera view for trimming (0=exact edge)")
+
+    trim_view_margin: FloatProperty(
+        name="View Margin",
+        description="Margin from camera view edges (0.0 to 0.49). Lines inside this margin are always kept.",
+        default=0.05,  # Slightly inside the camera border
+        min=0.0, max=0.49, subtype='FACTOR'
+    )
+    trim_keep_near_border_distance: FloatProperty(
+        name="Keep Near Border",
+        description="Normalized distance outside the camera border to keep and trim lines (0.0 = only inside, 0.1 = keep lines just outside border).",
+        default=0.1, min=0.0, max=0.5, subtype='FACTOR'
+    )
+    trim_min_visible_segment_length: FloatProperty(
+        name="Min Segment Length",
+        description="Minimum world-space length for a trimmed line segment to be kept.",
+        default=0.05, min=0.001, max=200.0
+    )
+    trim_delete_lines_outside_strict_view: BoolProperty(
+        name="Delete Only Far Lines",
+        description="If true, only lines far from the camera view are deleted. Lines near the border are kept.",
+        default=False
+    )
+    trim_deletion_distance_threshold: FloatProperty(
+        name="Deletion Distance Threshold",
+        description="Normalized distance outside the camera view to delete lines (used only if 'Delete Only Far Lines' is true).",
+        default=0.2, min=0.0, max=2.0
+    )
+    trim_start_percent: FloatProperty(
+        name="Start % Inside",
+        description="Where to start the trimmed line as a percentage of the visible segment (0 = at border, 0.2 = 20% into view)",
+        default=0.0, min=0.0, max=0.9, subtype='FACTOR'
+    )
+    trim_end_percent: FloatProperty(
+        name="End % Inside",
+        description="Where to end the trimmed line as a percentage of the visible segment (1 = at far border, 0.8 = 80% into view)",
+        default=1.0, min=0.1, max=1.0, subtype='FACTOR'
+    )
+# -----------------------------------------------------------
+# Helper: Add Vanishing Point Empty if Missing
+# -----------------------------------------------------------
+def add_vp_empty_if_missing(context, target_vp_name, default_location, empty_color=(0.8, 0.8, 0.8, 1.0)): # Removed type_key_for_1p_z_snap
+    vp_obj = bpy.data.objects.get(target_vp_name)
+    if not vp_obj:
+        helpers_coll = get_helpers_collection(context)
+        vp_obj = bpy.data.objects.new(target_vp_name, None)
+        helpers_coll.objects.link(vp_obj)
+        vp_obj.empty_display_type = 'SPHERE'
+        vp_obj.empty_display_size = 0.35
+        vp_obj.location = default_location
+        vp_obj.color = empty_color[:4] # Ensure it's RGBA
+        # No automatic Z snapping for ONE_POINT mode based on previous fix
+        return vp_obj
+    else:
+        # If VP exists, preserve its location unless default_location is explicitly different
+        # For this function's purpose, if it exists, we generally want to preserve its location.
+        # However, the calling functions (create_default_... ) handle location logic.
+        # We'll update color here if needed.
+        vp_obj.color = empty_color[:4]
+        return vp_obj
+
+
+# -----------------------------------------------------------
+# Operators
+# -----------------------------------------------------------
+
+# ... (Keep all your existing code before the operators, including bl_info, utility functions, properties, etc.) ...
+
+# MAKE SURE 'get_guides_collection' and HORIZON_CURVE_OBJ_NAME are defined before this point.
+
+class PERSPECTIVE_OT_clear_grid_planes(Operator):
+    bl_idname = "perspective_splines.clear_grid_planes"
+    bl_label = "Clear Only Grid Planes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        count = clear_guides_with_prefix(context, ["GridPlane_"])
+        self.report({'INFO'}, f"Cleared {count} grid plane objects." if count > 0 else "No grid planes to clear.")
+        return {'FINISHED'}
+    
+
+class PERSPECTIVE_OT_toggle_guide_visibility(Operator):
+    bl_idname = "perspective_splines.toggle_guide_visibility"
+    bl_label = "Toggle Guide Group Visibility"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_prefix: StringProperty(name="Guide Group Prefix")
+    # Optional: target_visibility: BoolProperty(name="Target Visibility") # To explicitly set, not just toggle
+
+    def execute(self, context):
+        if not self.group_prefix:
+            self.report({'WARNING'}, "No guide group prefix specified.")
+            return {'CANCELLED'}
+
+        guides_coll = get_guides_collection(context)
+        if not guides_coll:
+            self.report({'INFO'}, "Guides collection not found.")
+            return {'CANCELLED'}
+
+        found_any = False
+        # Determine new visibility state: if any are visible, hide all; else show all
+        # This is a simple toggle logic. More advanced would use stored states.
+        currently_any_visible = False
+        for obj in guides_coll.objects:
+            if obj.name.startswith(self.group_prefix) and not obj.hide_viewport:
+                currently_any_visible = True
+                break
+        
+        new_hide_state = currently_any_visible # If any are visible, new state is to hide them
+
+        for obj in guides_coll.objects:
+            if obj.type == 'CURVE' and obj.name.startswith(self.group_prefix):
+                obj.hide_viewport = new_hide_state
+                found_any = True
+        
+        if not found_any:
+            self.report({'INFO'}, f"No guides found with prefix '{self.group_prefix}'.")
+        else:
+            action = "Hid" if new_hide_state else "Shown"
+            self.report({'INFO'}, f"{action} guides for group '{self.group_prefix}'.")
+        
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_create_box_grid(Operator):
+    bl_idname = "perspective_splines.create_box_grid"
+    bl_label = "Create Perspective Box Grid"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def create_plane_grid(self, context, center, size_u, size_v, subs_u, subs_v,
+                          u_axis_vec, v_axis_vec, normal_vec,
+                          plane_name_suffix, guides_coll, ts):
+        """ Helper to create a single grid plane """
+        all_spline_data = []
+        half_size_u = size_u / 2.0
+        half_size_v = size_v / 2.0
+
+        # Lines along V direction (varying U)
+        for i in range(subs_u + 1):
+            t = (i / subs_u) - 0.5 # from -0.5 to 0.5
+            p_offset = u_axis_vec * (t * size_u)
+            pt1 = center + p_offset - (v_axis_vec * half_size_v)
+            pt2 = center + p_offset + (v_axis_vec * half_size_v)
+            all_spline_data.append([pt1, pt2])
+
+        # Lines along U direction (varying V)
+        for i in range(subs_v + 1):
+            t = (i / subs_v) - 0.5 # from -0.5 to 0.5
+            p_offset = v_axis_vec * (t * size_v)
+            pt1 = center + p_offset - (u_axis_vec * half_size_u)
+            pt2 = center + p_offset + (u_axis_vec * half_size_u)
+            all_spline_data.append([pt1, pt2])
+        
+        if all_spline_data:
+            # Create one object per plane grid for easier management
+            grid_obj_name = f"GridPlane_{plane_name_suffix}"
+            # Ensure unique name
+            idx = 1
+            temp_name = grid_obj_name
+            while temp_name in bpy.data.objects:
+                temp_name = f"{grid_obj_name}.{str(idx).zfill(3)}"
+                idx +=1
+            grid_obj_name = temp_name
+
+            create_curve_object(context, grid_obj_name, all_spline_data, guides_coll,
+                                ts.guide_curves_thickness, ts.guide_curves_opacity)
+            return True
+        return False
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["GridPlane_"]) # Clear old grids
+
+        center = Vector(ts.grid_center)
+        size = Vector(ts.grid_size)
+        subs_u = ts.grid_subdivisions_u
+        subs_v = ts.grid_subdivisions_v # Using U for lines along one axis, V for lines along the other for each plane.
+
+        created_any = False
+
+        # Front (+Y) / Back (-Y) : YZ plane, U is Z, V is X
+        if ts.grid_draw_front:
+            plane_center = center + Vector((0, size.y / 2.0, 0))
+            if self.create_plane_grid(context, plane_center, size.z, size.x, subs_v, subs_u, 
+                                 Vector((0,0,1)), Vector((1,0,0)), Vector((0,1,0)), "Front", guides_coll, ts):
+                created_any = True
+        if ts.grid_draw_back:
+            plane_center = center - Vector((0, size.y / 2.0, 0))
+            if self.create_plane_grid(context, plane_center, size.z, size.x, subs_v, subs_u, 
+                                 Vector((0,0,1)), Vector((1,0,0)), Vector((0,-1,0)), "Back", guides_coll, ts):
+                created_any = True
+        
+        # Top (+Z) / Bottom (-Z) : XY plane, U is X, V is Y
+        if ts.grid_draw_top:
+            plane_center = center + Vector((0,0, size.z / 2.0))
+            if self.create_plane_grid(context, plane_center, size.x, size.y, subs_u, subs_v,
+                                 Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1)), "Top", guides_coll, ts):
+                created_any = True
+        if ts.grid_draw_bottom:
+            plane_center = center - Vector((0,0, size.z / 2.0))
+            if self.create_plane_grid(context, plane_center, size.x, size.y, subs_u, subs_v,
+                                 Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,-1)), "Bottom", guides_coll, ts):
+                created_any = True
+
+        # Right (+X) / Left (-X) : XZ plane (careful, Blender's XZ is often Y up), let's say YZ plane, U is Y, V is Z
+        # For side views, let's use YZ plane where U is Y, V is Z.
+        if ts.grid_draw_right: # +X side
+            plane_center = center + Vector((size.x / 2.0, 0, 0))
+            if self.create_plane_grid(context, plane_center, size.y, size.z, subs_u, subs_v, # U along Y, V along Z
+                                 Vector((0,1,0)), Vector((0,0,1)), Vector((1,0,0)), "Right", guides_coll, ts):
+                 created_any = True
+        if ts.grid_draw_left: # -X side
+            plane_center = center - Vector((size.x / 2.0, 0, 0))
+            if self.create_plane_grid(context, plane_center, size.y, size.z, subs_u, subs_v,
+                                 Vector((0,1,0)), Vector((0,0,1)), Vector((-1,0,0)), "Left", guides_coll, ts):
+                created_any = True
+
+        if created_any:
+            self.report({'INFO'}, "Generated grid plane(s).")
+        else:
+            self.report({'INFO'}, "No grid planes selected for drawing.")
+        return {'FINISHED'}    
+
+class PERSPECTIVE_OT_merge_specific_guides(Operator):
+    bl_idname = "perspective_splines.merge_specific_guides"
+    bl_label = "Merge Specific Perspective Guides"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    group_identifier: StringProperty(
+        name="Guide Group Identifier",
+        description="Identifier for the group of guides to merge (e.g., 2P_VP1, ALL_CURRENT_TYPE)",
+        default="ALL_SCENE_GUIDES_FALLBACK" # Default to merging all if no specific group given
+    )
+
+    # This dictionary maps a 'group_identifier' to:
+    # 1. A tuple of prefixes to identify the curves for that group.
+    # 2. A suggested suffix for the merged object's name.
+    # This will be populated dynamically or used with perspective-type specific sub-mappings.
+    
+    # Structure: PERSPECTIVE_TYPE_KEY: { GROUP_NAME_FOR_UI: ( (PREFIX1, PREFIX2, ...), "MergedNameSuffix" ) }
+    GUIDE_GROUP_DEFS = {
+        'ONE_POINT': {
+            'MAIN_LINES': (("1P_Guides",), "1P_Lines")
+        },
+        'TWO_POINT': {
+            'VP1_LINES': (("2P_Guides_VP1",), "2P_VP1_Lines"),
+            'VP2_LINES': (("2P_Guides_VP2",), "2P_VP2_Lines"),
+            'VERTICAL_LINES': (("2P_Guides_Vertical",), "2P_Vertical_Lines")
+        },
+        'THREE_POINT': {
+            'H1_LINES': (("3P_Guides_H1",), "3P_H1_Lines"),
+            'H2_LINES': (("3P_Guides_H2",), "3P_H2_Lines"),
+            'V_LINES': (("3P_Guides_V",), "3P_V_Lines")
+        },
+        'FISH_EYE': {
+            # FE guides might be FE_Guides_Lon_X or FE_Guides_Lat_X or just FE_Guides_X
+            'LONGITUDE_LINES': (("FE_Guides_Lon",), "FE_Longitude_Lines"), # Specific if you named them like this
+            'LATITUDE_LINES': (("FE_Guides_Lat",), "FE_Latitude_Lines"),   # Specific if you named them like this
+            'ALL_FE_LINES': (("FE_Guides",), "FE_All_Lines") # General prefix for all FE guides
+        }
+    }
+
+
+    @classmethod
+    def poll(cls, context):
+        guides_coll = get_guides_collection(context)
+        return guides_coll and any(o.type == 'CURVE' and o.name != HORIZON_CURVE_OBJ_NAME for o in guides_coll.objects)
+
+    def get_curves_for_group(self, context, guides_coll):
+        tool_settings = context.scene.perspective_tool_settings_splines
+        current_perspective_type = tool_settings.current_perspective_type
+        
+        curves_to_process = []
+        target_prefixes = []
+        merged_name_suffix = "Guides" # Default suffix
+
+        if self.group_identifier == "ALL_SCENE_GUIDES_FALLBACK":
+            # Collect all known guide prefixes regardless of type for a true "merge all"
+            all_known_prefixes = set()
+            for type_key, groups in self.GUIDE_GROUP_DEFS.items():
+                for group_key, (prefixes, _) in groups.items():
+                    all_known_prefixes.update(prefixes)
+            if not all_known_prefixes: # Fallback if GUIDE_GROUP_DEFS is empty somehow
+                 all_known_prefixes = ("1P_Guides", "2P_Guides_", "3P_Guides_", "FE_Guides_")
+
+            target_prefixes = tuple(all_known_prefixes)
+            merged_name_suffix = "All_Scene_Guides"
+
+        elif self.group_identifier == "ALL_CURRENT_TYPE":
+            if current_perspective_type != 'NONE' and current_perspective_type in self.GUIDE_GROUP_DEFS:
+                current_type_defs = self.GUIDE_GROUP_DEFS[current_perspective_type]
+                all_type_prefixes = set()
+                for _, (prefixes, _) in current_type_defs.items():
+                    all_type_prefixes.update(prefixes)
+                target_prefixes = tuple(all_type_prefixes)
+                merged_name_suffix = f"{current_perspective_type.replace('_','')}All_Guides"
+            else: # No specific type or no defs for it
+                return [], "Guides_NoType"
+
+        else: # Specific group for the current type (e.g., "2P_VP1_LINES")
+            if current_perspective_type != 'NONE' and current_perspective_type in self.GUIDE_GROUP_DEFS:
+                current_type_defs = self.GUIDE_GROUP_DEFS[current_perspective_type]
+                # The group_identifier should directly match a key in current_type_defs
+                # e.g. group_identifier = "VP1_LINES" for perspective_type 'TWO_POINT'
+                if self.group_identifier in current_type_defs:
+                    prefixes_tuple, suffix_from_def = current_type_defs[self.group_identifier]
+                    target_prefixes = prefixes_tuple
+                    merged_name_suffix = suffix_from_def
+                else: # Identifier not found for current type
+                    return [], f"UnknownGroup_{self.group_identifier}"
+            else: # No type selected for specific group
+                return [], f"Guides_NoType_For_{self.group_identifier}"
+
+        if not target_prefixes:
+            return [], "NoPrefixes"
+
+        for obj in guides_coll.objects:
+            if obj.type == 'CURVE' and obj.name != HORIZON_CURVE_OBJ_NAME:
+                for prefix in target_prefixes:
+                    if obj.name.startswith(prefix):
+                        curves_to_process.append(obj)
+                        break # Object matched, move to next object
+        
+        return curves_to_process, merged_name_suffix
+
+
+    def execute(self, context):
+        guides_coll = get_guides_collection(context)
+        if not guides_coll:
+            self.report({'INFO'}, "Guides collection not found.")
+            return {'CANCELLED'}
+
+        curves_to_merge, base_name_suffix = self.get_curves_for_group(context, guides_coll)
+
+        if not curves_to_merge:
+            self.report({'INFO'}, f"No guide curves found for group identifier: '{self.group_identifier}'.")
+            return {'CANCELLED'}
+
+        if len(curves_to_merge) < 2:
+            self.report({'INFO'}, f"Only {len(curves_to_merge)} curve(s) found for '{self.group_identifier}'. No merge needed or possible.")
+            if curves_to_merge: # If one, select it
+                bpy.ops.object.select_all(action='DESELECT')
+                try:
+                    curves_to_merge[0].select_set(True)
+                    context.view_layer.objects.active = curves_to_merge[0]
+                except ReferenceError:
+                    self.report({'WARNING'}, "The single curve found no longer exists.")
+                    return {'CANCELLED'}
+            return {'FINISHED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        
+        original_active = context.view_layer.objects.active
+        original_selection = list(context.selected_objects) # Make a copy
+        
+        bpy.ops.object.select_all(action='DESELECT')
+        valid_curves_for_join = []
+        for obj in curves_to_merge:
+            if obj.name in bpy.data.objects: # Check if object still exists
+                obj.select_set(True)
+                valid_curves_for_join.append(obj)
+            else:
+                print(f"Info: Object '{obj.name}' for merge group '{self.group_identifier}' no longer exists.")
+        
+        if len(valid_curves_for_join) < 2:
+            self.report({'INFO'}, f"Not enough valid curves ({len(valid_curves_for_join)}) remaining to merge for '{self.group_identifier}'.")
+            # Restore original selection
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj_sel in original_selection:
+                if obj_sel and obj_sel.name in bpy.data.objects:
+                    try: obj_sel.select_set(True)
+                    except ReferenceError: pass
+            if original_active and original_active.name in bpy.data.objects:
+                try: context.view_layer.objects.active = original_active
+                except ReferenceError: pass
+            return {'CANCELLED'}
+            
+        context.view_layer.objects.active = valid_curves_for_join[0]
+
+        try:
+            bpy.ops.object.join()
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Merge failed for group '{self.group_identifier}': {e}")
+            # Restore original selection attempt
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj_sel in original_selection:
+                if obj_sel and obj_sel.name in bpy.data.objects:
+                   try: obj_sel.select_set(True)
+                   except ReferenceError: pass
+            if original_active and original_active.name in bpy.data.objects:
+                try: context.view_layer.objects.active = original_active
+                except ReferenceError: pass
+            return {'CANCELLED'}
+        
+        merged_obj = context.active_object
+        if merged_obj:
+            # Create a unique name for the merged object
+            final_name_base = f"Merged_{base_name_suffix}"
+            current_name_to_check = final_name_base
+            idx = 1
+            while current_name_to_check in bpy.data.objects and bpy.data.objects[current_name_to_check] != merged_obj:
+                current_name_to_check = f"{final_name_base}.{str(idx).zfill(3)}"
+                idx += 1
+            merged_obj.name = current_name_to_check
+            self.report({'INFO'}, f"Merged {len(valid_curves_for_join)} guides for '{self.group_identifier}' into: {merged_obj.name}")
+        else:
+            self.report({'WARNING'}, "Merge did not result in an active object.")
+            # Restore selection might be complex here if join partly failed.
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+
+# --- Keep your existing PERSPECTIVE_OT_merge_guides if you want a simple "Merge All in Collection" button ---
+# OR remove it if PERSPECTIVE_OT_merge_specific_guides with "ALL_SCENE_GUIDES_FALLBACK" covers its need.
+# For now, let's assume you might want to keep it as a distinct "merge all visible guides".
+
+class PERSPECTIVE_OT_merge_guides(Operator): # This is your existing "Merge Guides Only"
+    bl_idname = "perspective_splines.merge_guides"
+    bl_label = "Merge All Visible Guides" # Renamed label for clarity if keeping both merge ops
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        guides_coll = get_guides_collection(context)
+        curves_to_merge = [
+            o for o in guides_coll.objects 
+            if o.type == 'CURVE' and o.data and o.data.splines and o.name != HORIZON_CURVE_OBJ_NAME
+        ]
+        if not curves_to_merge:
+            self.report({'INFO'}, "No guide curves found to merge.")
+            return {'CANCELLED'}
+        
+        if len(curves_to_merge) < 2:
+            self.report({'INFO'}, "Only one guide curve present. No merge needed.")
+            if curves_to_merge: # Select the single curve
+                bpy.ops.object.select_all(action='DESELECT')
+                try:
+                    curves_to_merge[0].select_set(True)
+                    context.view_layer.objects.active = curves_to_merge[0]
+                except ReferenceError: pass
+            return {'FINISHED'} # Or CANCELLED
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        
+        original_active = context.view_layer.objects.active
+        original_selection = list(context.selected_objects) 
+        bpy.ops.object.select_all(action='DESELECT')
+        
+        valid_curves_for_join = []
+        for obj in curves_to_merge:
+            if obj.name in bpy.data.objects:
+                obj.select_set(True)
+                valid_curves_for_join.append(obj)
+        
+        if len(valid_curves_for_join) < 2:
+            self.report({'INFO'}, "Not enough valid curves remaining to merge.")
+            # Restore original selection
+            # ... (similar restoration as in merge_specific_guides) ...
+            return {'CANCELLED'}
+            
+        context.view_layer.objects.active = valid_curves_for_join[0]
+
+        try:
+            bpy.ops.object.join()
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Merge all guides failed: {e}")
+            # ... (similar restoration) ...
+            return {'CANCELLED'}
+        
+        merged_obj = context.active_object
+        if merged_obj:
+            base_name = "Merged_All_Guides"
+            current_name_to_check = base_name
+            idx = 1
+            while current_name_to_check in bpy.data.objects and bpy.data.objects[current_name_to_check] != merged_obj:
+                current_name_to_check = f"{base_name}.{str(idx).zfill(3)}"
+                idx += 1
+            merged_obj.name = current_name_to_check
+            self.report({'INFO'}, f"Merged all guides into object: {merged_obj.name}")
+        else:
+            self.report({'WARNING'}, "Merge all operation did not result in an active object.")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class PERSPECTIVE_OT_merge_guides(Operator):
+    bl_idname = "perspective_splines.merge_guides"
+    bl_label = "Merge Guides Only"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        guides_coll = get_guides_collection(context)
+        # Select all curve objects in the guides collection (except the horizon curve)
+        curves_to_merge = [o for o in guides_coll.objects 
+                           if o.type == 'CURVE' and o.data and o.data.splines and o.name != HORIZON_CURVE_OBJ_NAME]
+        if not curves_to_merge:
+            self.report({'INFO'}, "No guide curves found to merge.")
+            return {'CANCELLED'}
+        
+        # Ensure we are in Object mode
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        
+        original_active = context.view_layer.objects.active
+        original_selection = list(context.selected_objects) # Make a copy
+        bpy.ops.object.select_all(action='DESELECT')
+        
+        for obj in curves_to_merge:
+            obj.select_set(True)
+        
+        if not curves_to_merge: # Should be caught earlier, but as a safeguard
+            bpy.ops.object.select_all(action='DESELECT') # Restore selection
+            for obj in original_selection:
+                if obj and obj.name in bpy.data.objects: # Check if obj still exists
+                   try: obj.select_set(True)
+                   except ReferenceError: pass
+            context.view_layer.objects.active = original_active
+            self.report({'ERROR'}, "No curves were selected for merging.")
+            return {'CANCELLED'}
+            
+        context.view_layer.objects.active = curves_to_merge[0]
+
+        try:
+            bpy.ops.object.join()
+        except RuntimeError as e:
+            self.report({'ERROR'}, f"Merge failed: {e}")
+            # Restore selection before returning
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in original_selection:
+                if obj and obj.name in bpy.data.objects:
+                   try: obj.select_set(True)
+                   except ReferenceError: pass
+            context.view_layer.objects.active = original_active
+            return {'CANCELLED'}
+        
+        merged_obj = context.active_object
+        if merged_obj:
+            self.report({'INFO'}, f"Merged guides into object: {merged_obj.name}")
+        else:
+            self.report({'WARNING'}, "Merge operation did not result in an active object.")
+            # Attempt to restore selection
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in original_selection:
+                if obj and obj.name in bpy.data.objects:
+                   try: obj.select_set(True)
+                   except ReferenceError: pass
+            context.view_layer.objects.active = original_active
+            return {'CANCELLED'}
+
+
+        # Restore original selection (optional, but good practice if they weren't part of the merge)
+        # For this operator, the merged object becomes the new selection.
+        # If you want to restore the previous broader selection, uncomment:
+        # bpy.ops.object.select_all(action='DESELECT')
+        # for obj in original_selection:
+        #     if obj and obj.name in bpy.data.objects and obj.name != merged_obj.name:
+        #         try: obj.select_set(True)
+        #         except ReferenceError: pass
+        # if merged_obj and merged_obj.name in bpy.data.objects: # Ensure merged object remains selected
+        #    merged_obj.select_set(True)
+        #    context.view_layer.objects.active = merged_obj
+        # else:
+        #    context.view_layer.objects.active = original_active
+
+        return {'FINISHED'}
+
+
+
+# ... (Rest of your operators: PERSPECTIVE_OT_generate_horizon_spline, etc. down to PERSPECTIVE_OT_convert_to_grease_pencil)
+
+class PERSPECTIVE_OT_generate_horizon_spline(Operator):
+    bl_idname = "perspective_splines.generate_horizon"
+    bl_label = "Create/Set Horizon Ctrl & Visual"
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context):
+        tool_settings = context.scene.perspective_tool_settings_splines
+        helpers_coll = get_helpers_collection(context)
+        horizon_ctrl = get_horizon_control_object()
+        if not horizon_ctrl:
+            horizon_ctrl = bpy.data.objects.new(HORIZON_CTRL_OBJ_NAME, None)
+            helpers_coll.objects.link(horizon_ctrl)
+            horizon_ctrl.empty_display_type = 'CIRCLE'
+            horizon_ctrl.empty_display_size = 0.5
+        horizon_ctrl.location = Vector((0, 0, tool_settings.horizon_y_level))
+
+        horizon_curve_obj = get_horizon_curve_object()
+        if not horizon_curve_obj:
+            guides_coll = get_guides_collection(context)
+            hz_len = tool_settings.horizon_line_length / 2.0
+            # Points for the horizon curve visual should be relative to its object origin (0,0,0)
+            # The update_dynamic_horizon_line_curve function handles setting world space coords.
+            # For initial creation, we can use simple points, they will be updated.
+            pts = [Vector((-hz_len, 0, 0)), Vector((hz_len, 0, 0))]
+            col = list(tool_settings.horizon_line_color) # Get the RGBA color from settings
+            horizon_curve_obj = create_curve_object(context, HORIZON_CURVE_OBJ_NAME, [pts], guides_coll,
+                                        bevel_depth=tool_settings.horizon_line_thickness,
+                                        opacity=col[3], color_rgb=col[:3]) # Pass opacity and color_rgb separately
+            if not horizon_curve_obj:
+                self.report({'ERROR'}, "Failed to create horizon visual line.")
+                return {'CANCELLED'}
+            # Position the curve object itself at the horizon Z, though update_dynamic... might override
+            # horizon_curve_obj.location.z = tool_settings.horizon_y_level 
+            # Actually, update_dynamic_horizon_line_curve expects it at world origin if it's placing VPs directly.
+            # For 1P, it effectively re-centers it. So (0,0,0) is fine.
+
+        update_dynamic_horizon_line_curve(context) # This will correctly position/shape it
+        self.report({'INFO'}, f"Horizon elements set. Ctrl Z: {tool_settings.horizon_y_level:.2f}")
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_add_vanishing_point_empty(Operator):
+    bl_idname = "perspective_splines.add_vp_empty"
+    bl_label = "Add Generic VP Empty"
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context):
+        tool_settings = context.scene.perspective_tool_settings_splines
+        prefix = VP_PREFIX + "Custom" # Default for generic
+        if tool_settings.current_perspective_type in VP_TYPE_SPECIFIC_PREFIX_MAP:
+            prefix = VP_TYPE_SPECIFIC_PREFIX_MAP[tool_settings.current_perspective_type]
+
+        num = 1
+        while f"{prefix}_Generic_{num}" in bpy.data.objects: num += 1
+        vp_name = f"{prefix}_Generic_{num}"
+        vp_obj = add_vp_empty_if_missing(context, vp_name, context.scene.cursor.location.copy(), empty_color=(0.7,0.7,0.7,1.0)) # Pass empty_color
+        vp_obj.empty_display_type = 'CUBE' # Differentiate generic
+        self.report({'INFO'}, f"Added generic VP: {vp_name}")
+        try:
+            update_dynamic_horizon_line_curve(context)
+            update_vp_empty_colors(tool_settings, context)
+        except Exception as e: print(f"Error in updates post add_vp_empty: {e}")
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_remove_selected_helper_empty(Operator):
+    bl_idname = "perspective_splines.remove_selected_helper_empty"
+    bl_label = "Remove Selected Helper"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, context):
+        act_obj = context.active_object
+        return act_obj and act_obj.type == 'EMPTY' and \
+               (act_obj.name.startswith(VP_PREFIX) or act_obj.name == HORIZON_CTRL_OBJ_NAME)
+    def execute(self, context):
+        obj_to_remove = context.active_object
+        name = obj_to_remove.name
+        is_hz_ctrl = (name == HORIZON_CTRL_OBJ_NAME)
+        try: bpy.data.objects.remove(obj_to_remove, do_unlink=True)
+        except: pass # Ignore if already gone
+        if is_hz_ctrl:
+            try: bpy.ops.perspective_splines.clear_horizon('EXEC_DEFAULT')
+            except Exception as e: print(f"Error clearing horizon after ctrl removal: {e}")
+        try: update_dynamic_horizon_line_curve(context)
+        except Exception as e: print(f"Error updating horizon after helper removal: {e}")
+        self.report({'INFO'}, f"Removed helper: {name}.")
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_clear_type_guides_splines(Operator):
+    bl_idname = "perspective_splines.clear_type_guides"
+    bl_label = "Clear Type VPs & Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+    type_filter_prop: StringProperty(name="Type to Clear", default="")
+    def execute(self, context):
+        tool_settings = context.scene.perspective_tool_settings_splines
+        type_key = self.type_filter_prop if self.type_filter_prop else tool_settings.current_perspective_type
+        if type_key == 'NONE' and not self.type_filter_prop:
+            self.report({'INFO'}, "No type selected/specified to clear.")
+            return {'CANCELLED'}
+        print(f"Clearing VPs & Guides for type: {type_key}")
+        vp_prefixes_remove, guide_prefixes_clear = [], []
+        if type_key == 'ONE_POINT':
+            vp_prefixes_remove.append(VP_TYPE_SPECIFIC_PREFIX_MAP['ONE_POINT'])
+            guide_prefixes_clear.append("1P_Guides")
+        elif type_key == 'TWO_POINT':
+            vp_prefixes_remove.append(VP_TYPE_SPECIFIC_PREFIX_MAP['TWO_POINT'])
+            guide_prefixes_clear.extend(["2P_Guides_VP1", "2P_Guides_VP2", "2P_Guides_Vertical"])
+        elif type_key == 'THREE_POINT':
+            vp_prefixes_remove.append(VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_H'])
+            vp_prefixes_remove.append(VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_V'])
+            guide_prefixes_clear.extend(["3P_Guides_H1", "3P_Guides_H2", "3P_Guides_V"])
+        elif type_key == 'FISH_EYE':
+            vp_prefixes_remove.append(VP_TYPE_SPECIFIC_PREFIX_MAP['FISH_EYE'])
+            guide_prefixes_clear.append("FE_Guides")
+        
+        all_scene_vps = get_vanishing_points() # Get all once
+        for prefix in vp_prefixes_remove:
+            for vp in list(all_scene_vps): # Iterate copy
+                if vp.name.startswith(prefix):
+                    try: bpy.data.objects.remove(vp, do_unlink=True)
+                    except: pass
+        if guide_prefixes_clear: clear_guides_with_prefix(context, guide_prefixes_clear)
+        try: update_dynamic_horizon_line_curve(context)
+        except Exception as e: print(f"Error updating horizon after type clear: {e}")
+        self.report({'INFO'}, f"Cleared VPs & Guides for: {type_key}.")
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_clear_just_guides(Operator):
+    bl_idname = "perspective_splines.clear_just_guides"
+    bl_label = "Clear ONLY Guide Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context):
+        prefixes = ["1P_Guides", "2P_Guides_VP1", "2P_Guides_VP2", "2P_Guides_Vertical",
+                    "3P_Guides_H1", "3P_Guides_H2", "3P_Guides_V", "FE_Guides"]
+        count = clear_guides_with_prefix(context, prefixes)
+        self.report({'INFO'}, f"Cleared {count} guide objects." if count > 0 else "No guides to clear.")
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_clear_horizon_spline(Operator):
+    bl_idname = "perspective_splines.clear_horizon"
+    bl_label = "Clear Horizon Elements"
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context):
+        cleared = 0
+        hz_ctrl = get_horizon_control_object()
+        if hz_ctrl:
+            try: bpy.data.objects.remove(hz_ctrl, do_unlink=True); cleared+=1
+            except: pass
+        hz_curve = get_horizon_curve_object()
+        if hz_curve:
+            try:
+                if hz_curve.data and hz_curve.data.name in bpy.data.curves and hz_curve.data.users <=1:
+                    bpy.data.curves.remove(hz_curve.data)
+                bpy.data.objects.remove(hz_curve, do_unlink=True); cleared+=1
+            except: pass
+        self.report({'INFO'}, "Horizon elements cleared." if cleared > 0 else "No horizon elements to clear.")
+        try: update_dynamic_horizon_line_curve(context) # Should effectively hide it
+        except Exception as e: print(f"Error updating horizon after clear_horizon: {e}")
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_clear_all_perspective_splines(Operator):
+    bl_idname = "perspective_splines.clear_all"
+    bl_label = "Clear ALL Perspective Helpers"
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context):
+        print("Attempting to clear ALL perspective data...")
+        for vp in get_vanishing_points(): # Get all VPs regardless of type
+            try: bpy.data.objects.remove(vp, do_unlink=True)
+            except Exception as e: print(f"  Failed to remove VP {vp.name}: {e}")
+        try: bpy.ops.perspective_splines.clear_horizon('EXEC_DEFAULT')
+        except Exception as e: print(f"  Failed to clear horizon elements: {e}")
+        all_guide_prefixes = ["1P_Guides", "2P_Guides_VP1", "2P_Guides_VP2", "2P_Guides_Vertical",
+                              "3P_Guides_H1", "3P_Guides_H2", "3P_Guides_V", "FE_Guides"]
+        clear_guides_with_prefix(context, all_guide_prefixes)
+        try: update_dynamic_horizon_line_curve(context)
+        except Exception as e: print(f"  Error updating horizon post clear all: {e}")
+        self.report({'INFO'}, "Cleared ALL perspective data.")
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_generate_one_point_splines(Operator):
+    bl_idname = "perspective_splines.generate_one_point"
+    bl_label = "Generate 1P Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def create_default_one_point(cls, context):
+        ts = context.scene.perspective_tool_settings_splines
+        name = VP_TYPE_SPECIFIC_PREFIX_MAP['ONE_POINT'] + "_1"
+        existing_vp = bpy.data.objects.get(name)
+        loc = Vector((0,0,0)) # Default location
+        if existing_vp:
+            loc = existing_vp.location.copy()
+        else:
+            hc = get_horizon_control_object()
+            if hc:
+                loc = Vector((0, 0, hc.location.z)) # Default X, Y at origin, Z from horizon control
+            else:
+                loc = Vector((0, 0, ts.horizon_y_level)) # Fallback to tool setting for Z
+
+        add_vp_empty_if_missing(context, name, loc, ts.one_point_vp_empty_color)
+    
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        vps_check = get_vanishing_points('ONE_POINT')
+        
+        if not get_horizon_control_object() and not vps_check:
+            try:
+                bpy.ops.perspective_splines.generate_horizon('EXEC_DEFAULT')
+            except Exception as e:
+                print(f"Error ensuring horizon for 1P (no VP, no HC): {e}")
+
+        PERSPECTIVE_OT_generate_one_point_splines.create_default_one_point(context)
+        
+        vps = get_vanishing_points('ONE_POINT') 
+        if not vps:
+            self.report({'ERROR'}, "1P VP not found or could not be created.")
+            return {'CANCELLED'}
+        
+        if abs(ts.horizon_y_level - vps[0].location.z) > 0.001 :
+             ts.horizon_y_level = vps[0].location.z 
+
+        try: update_vp_empty_colors(ts, context)
+        except Exception as e: print(f"Error updating VP colors for 1P: {e}")
+        
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["1P_Guides"]) # Clear existing 1P guides
+        vp_loc = vps[0].location.copy()
+        spline_data = []
+        ext = ts.one_point_line_extension
+
+        if ts.one_point_draw_radial:
+            spline_data.extend(generate_radial_lines_in_plane(vp_loc, ts.one_point_grid_density_radial, ext, 'XZ'))
+        
+        if ts.one_point_draw_ortho_x:
+            half_grid_world_extent_x = ts.one_point_grid_extent * ext * 0.5 
+            vertical_spacing_world = ts.one_point_grid_extent * ext * 0.2 
+            density_x = ts.one_point_grid_density_ortho_x
+            for i in range(density_x + 1):
+                off_z_factor = (i / density_x - 0.5) * 2.0 if density_x > 0 else 0 
+                curr_z = vp_loc.z + off_z_factor * (vertical_spacing_world / 2.0)
+                spline_data.append([
+                    Vector((vp_loc.x - half_grid_world_extent_x, vp_loc.y, curr_z)),
+                    Vector((vp_loc.x + half_grid_world_extent_x, vp_loc.y, curr_z))
+                ])
+        
+        if ts.one_point_draw_ortho_y:
+            half_grid_world_extent_z = ts.one_point_grid_extent * ext * 0.5 
+            horizontal_spacing_world = ts.one_point_grid_extent * ext * 0.2 
+            density_y = ts.one_point_grid_density_ortho_y
+            for i in range(density_y + 1):
+                off_x_factor = (i / density_y - 0.5) * 2.0 if density_y > 0 else 0
+                curr_x = vp_loc.x + off_x_factor * (horizontal_spacing_world / 2.0)
+                spline_data.append([
+                    Vector((curr_x, vp_loc.y, vp_loc.z - half_grid_world_extent_z)),
+                    Vector((curr_x, vp_loc.y, vp_loc.z + half_grid_world_extent_z))
+                ])
+
+        if not spline_data:
+            self.report({'INFO'}, "No 1P lines to generate based on current settings.")
+            try: update_dynamic_horizon_line_curve(context)
+            except Exception as e: print(f"Error updating horizon (no 1P lines generated): {e}")
+            return {'FINISHED'}
+
+        # <<<< MODIFICATION IS HERE >>>>
+        opac = ts.guide_curves_opacity # Get global opacity from settings
+        thickness = ts.guide_curves_thickness # Get global thickness
+        created_count = 0
+        for i, pts_list in enumerate(spline_data): 
+            # Call create_curve_object WITHOUT the color_rgb argument
+            if create_curve_object(context, f"1P_Guides_{i+1}", [pts_list], guides_coll,
+                                thickness, opac): # Pass thickness and opacity
+                created_count +=1
+        # <<<< END OF MODIFICATION >>>>
+                                
+        self.report({'INFO'}, f"Generated {created_count} 1P line objects.")
+        try: update_dynamic_horizon_line_curve(context)
+        except Exception as e: print(f"Error updating horizon after 1P gen: {e}")
+        return {'FINISHED'}
+
+
+# (Place these after PERSPECTIVE_OT_generate_one_point_splines)
+
+class PERSPECTIVE_OT_create_2p_vps_if_needed(Operator):
+    """Helper to ensure 2P VPs exist, called by specific 2P line generators."""
+    bl_idname = "perspective_splines.create_2p_vps_if_needed"
+    bl_label = "Ensure 2P VPs"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+# Inside class PERSPECTIVE_OT_create_2p_vps_if_needed(Operator):
+    # Inside class PERSPECTIVE_OT_create_2p_vps_if_needed(Operator):
+
+    @classmethod
+    def create_default_two_point_vps(cls, context):
+        print("DEBUG: create_default_two_point_vps CALLED")
+        ts = context.scene.perspective_tool_settings_splines
+        prefix = VP_TYPE_SPECIFIC_PREFIX_MAP['TWO_POINT']
+        helpers_coll = get_helpers_collection(context) # Ensure helpers collection exists
+
+        # 1. Ensure Horizon Control Object and determine default Z for NEW VPs
+        horizon_ctrl = get_horizon_control_object()
+        if not horizon_ctrl:
+            print("DEBUG 2P VP Create: No horizon control, attempting to generate one.")
+            try:
+                # Call generate_horizon operator to create the control and visual
+                bpy.ops.perspective_splines.generate_horizon('EXEC_DEFAULT')
+                horizon_ctrl = get_horizon_control_object() # Try to get it again
+                if not horizon_ctrl:
+                    print("DEBUG 2P VP Create: CRITICAL - Failed to generate/get horizon control object.")
+                    # Fallback to tool settings if all else fails for Z
+                    default_hz_z_for_new_vps = ts.horizon_y_level
+                else:
+                    default_hz_z_for_new_vps = horizon_ctrl.location.z
+            except Exception as e:
+                print(f"DEBUG 2P VP Create: Error generating horizon: {e}")
+                default_hz_z_for_new_vps = ts.horizon_y_level # Fallback
+        else:
+            default_hz_z_for_new_vps = horizon_ctrl.location.z
+            # Sync tool setting with existing horizon control if they differ
+            if abs(ts.horizon_y_level - horizon_ctrl.location.z) > 0.001:
+                ts.horizon_y_level = horizon_ctrl.location.z
+
+
+        print(f"DEBUG: Default Z for new 2P VPs will be: {default_hz_z_for_new_vps}")
+
+        vp_definitions = [
+            {"name_suffix": "_1", "default_x": -10.0, "color_prop_name": "two_point_vp1_empty_color"},
+            {"name_suffix": "_2", "default_x": 10.0,  "color_prop_name": "two_point_vp2_empty_color"}
+        ]
+        
+        vps_changed_or_created = False
+        created_vps_for_horizon_update = []
+
+        for vp_def in vp_definitions:
+            vp_name = prefix + vp_def["name_suffix"]
+            vp_color_setting = getattr(ts, vp_def["color_prop_name"])
+            
+            existing_vp = bpy.data.objects.get(vp_name)
+
+            if existing_vp:
+                print(f"DEBUG: VP {vp_name} exists. Preserving location: {existing_vp.location}")
+                # Ensure it's in the correct collection
+                if existing_vp.name not in helpers_coll.objects:
+                    print(f"DEBUG: Linking existing VP {vp_name} to helpers collection.")
+                    # Unlink from other collections if necessary before linking here to avoid multi-collection link
+                    for coll in existing_vp.users_collection:
+                        if coll != helpers_coll:
+                            coll.objects.unlink(existing_vp)
+                    helpers_coll.objects.link(existing_vp)
+
+                # Update color if different
+                current_color_tuple = tuple(round(c, 4) for c in existing_vp.color)
+                setting_color_tuple = tuple(round(c, 4) for c in vp_color_setting)
+                if current_color_tuple != setting_color_tuple:
+                    print(f"DEBUG: Updating color for existing VP {vp_name}")
+                    existing_vp.color = list(vp_color_setting)
+                    vps_changed_or_created = True
+                created_vps_for_horizon_update.append(existing_vp) # Add for horizon update
+            else:
+                # VP does not exist, create it
+                default_loc = Vector((vp_def["default_x"], 0.0, default_hz_z_for_new_vps))
+                print(f"DEBUG: Creating NEW VP: {vp_name} at {default_loc}")
+                new_vp = add_vp_empty_if_missing(context, vp_name, default_loc, vp_color_setting)
+                if new_vp: # add_vp_empty_if_missing returns the object
+                    vps_changed_or_created = True
+                    created_vps_for_horizon_update.append(new_vp)
+                else:
+                    print(f"DEBUG: FAILED to create VP {vp_name}")
+        
+        if vps_changed_or_created:
+            print("DEBUG: At least one 2P VP was created or its color updated.")
+            update_vp_empty_colors(ts, context) # Update all VP empty colors based on settings
+        
+        # Always try to update the horizon line for 2P mode, as it's defined by the VPs.
+        # update_dynamic_horizon_line_curve will check if enough VPs exist.
+        print("DEBUG: Calling update_dynamic_horizon_line_curve from create_default_two_point_vps")
+        update_dynamic_horizon_line_curve(context)
+
+
+class PERSPECTIVE_OT_generate_2p_vp1_lines(Operator):
+    bl_idname = "perspective_splines.generate_2p_vp1_lines"
+    bl_label = "Generate 2P VP1 Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        bpy.ops.perspective_splines.create_2p_vps_if_needed()
+
+        vps = get_vanishing_points('TWO_POINT')
+        if not vps:
+            self.report({'ERROR'}, "2P VP1 not found. Create VPs first."); return {'CANCELLED'}
+        vp1 = vps[0] # Assumes sorted, VP_2P_1
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["2P_Guides_VP1_"]) # Note the underscore
+        ext = ts.two_point_line_extension
+        
+        lines_data = generate_radial_lines_in_plane(vp1.location.copy(), ts.two_point_grid_density_vp1, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No VP1 lines to generate."); return {'FINISHED'}
+        
+        opac = ts.guide_curves_opacity
+        thickness = ts.guide_curves_thickness
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"2P_Guides_VP1_{i+1}", [pts_list], guides_coll, thickness, opac):
+                created_count += 1
+        self.report({'INFO'}, f"Generated {created_count} 2P VP1 lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_generate_2p_vp2_lines(Operator):
+    bl_idname = "perspective_splines.generate_2p_vp2_lines"
+    bl_label = "Generate 2P VP2 Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        bpy.ops.perspective_splines.create_2p_vps_if_needed()
+
+        vps = get_vanishing_points('TWO_POINT')
+        if len(vps) < 2:
+            self.report({'ERROR'}, "2P VP2 not found. Create VPs first."); return {'CANCELLED'}
+        vp2 = vps[1] # Assumes sorted, VP_2P_2
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["2P_Guides_VP2_"]) # Note the underscore
+        ext = ts.two_point_line_extension
+        
+        lines_data = generate_radial_lines_in_plane(vp2.location.copy(), ts.two_point_grid_density_vp2, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No VP2 lines to generate."); return {'FINISHED'}
+
+        opac = ts.guide_curves_opacity
+        thickness = ts.guide_curves_thickness
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"2P_Guides_VP2_{i+1}", [pts_list], guides_coll, thickness, opac):
+                created_count +=1
+        self.report({'INFO'}, f"Generated {created_count} 2P VP2 lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_generate_2p_vertical_lines(Operator):
+    bl_idname = "perspective_splines.generate_2p_vertical_lines"
+    bl_label = "Generate 2P Vertical Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        bpy.ops.perspective_splines.create_2p_vps_if_needed() # Ensure VPs exist for context
+
+        vps = get_vanishing_points('TWO_POINT')
+        if len(vps) < 2:
+            self.report({'ERROR'}, "2P VPs not found for vertical line generation."); return {'CANCELLED'}
+        vp1_loc, vp2_loc = vps[0].location.copy(), vps[1].location.copy()
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["2P_Guides_Vertical_"]) # Note the underscore
+        
+        verts_data = []
+        num_verts = ts.two_point_grid_density_vertical
+        if num_verts >= 0:
+            h = ts.two_point_grid_height
+            y_off = ts.two_point_grid_depth_offset
+            x_space = ts.two_point_verticals_x_spacing_factor
+            avg_vp_x = (vp1_loc.x + vp2_loc.x) / 2.0
+            avg_vp_y = (vp1_loc.y + vp2_loc.y) / 2.0 
+            horizon_z = vp1_loc.z 
+            vp_x_dist = abs(vp1_loc.x - vp2_loc.x)
+            ext_fallback = ts.two_point_line_extension # Use this if VPs are too close
+            spread_width = vp_x_dist * x_space if vp_x_dist > 0.1 else ext_fallback * 0.5 * x_space
+            start_x = avg_vp_x - spread_width / 2.0
+            plane_y = avg_vp_y + y_off
+            
+            for i in range(num_verts + 1): 
+                t = (i / num_verts) if num_verts > 0 else 0.5 
+                curr_x = start_x + t * spread_width
+                verts_data.append([Vector((curr_x, plane_y, horizon_z - h/2.0)), 
+                                   Vector((curr_x, plane_y, horizon_z + h/2.0))])
+        
+        if not verts_data:
+            self.report({'INFO'}, "No Vertical lines to generate."); return {'FINISHED'}
+
+        opac = ts.guide_curves_opacity
+        thickness = ts.guide_curves_thickness
+        created_count = 0
+        for i, pts_list in enumerate(verts_data):
+            create_curve_object(context, f"2P_Guides_Vertical_{i+1}", [pts_list], guides_coll, thickness, opac)
+            created_count += 1
+        self.report({'INFO'}, f"Generated {created_count} 2P Vertical lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+    
+# (Around line 1050, after generate_two_point and before generate_fish_eye)
+
+class PERSPECTIVE_OT_create_3p_vps_if_needed(Operator):
+    """Helper to ensure 3P VPs exist, called by specific 3P line generators."""
+    bl_idname = "perspective_splines.create_3p_vps_if_needed"
+    bl_label = "Ensure 3P VPs"
+    bl_options = {'REGISTER', 'INTERNAL'} # Internal, not for UI
+
+    # Inside class PERSPECTIVE_OT_create_3p_vps_if_needed(Operator):
+    @classmethod
+    def create_default_three_point_vps(cls, context):
+        ts = context.scene.perspective_tool_settings_splines
+        h_pref = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_H']
+        v_pref = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_V']
+        
+        horizon_ctrl = get_horizon_control_object()
+        # Initial hz_z for NEW VPs if no horizon control exists
+        default_hz_z_for_new_vps = ts.horizon_y_level 
+        if horizon_ctrl:
+            default_hz_z_for_new_vps = horizon_ctrl.location.z
+
+        # --- VP H1 ---
+        vp_h1_name = h_pref + "_1"
+        vp_h1_obj = bpy.data.objects.get(vp_h1_name)
+        loc_h1 = Vector((-10, 0, default_hz_z_for_new_vps)) # Default for new VP
+        if vp_h1_obj:
+            loc_h1 = vp_h1_obj.location.copy() # Preserve existing location fully
+            # If you want H VPs to always snap to horizon control if it exists, uncomment next line
+            # if horizon_ctrl: loc_h1.z = horizon_ctrl.location.z
+        else: # If creating new H VP and horizon control exists, place it on that horizon
+            if horizon_ctrl: loc_h1.z = horizon_ctrl.location.z
+
+
+        # --- VP H2 ---
+        vp_h2_name = h_pref + "_2"
+        vp_h2_obj = bpy.data.objects.get(vp_h2_name)
+        loc_h2 = Vector((10, 0, default_hz_z_for_new_vps)) # Default for new VP
+        if vp_h2_obj:
+            loc_h2 = vp_h2_obj.location.copy() # Preserve existing location fully
+            # If you want H VPs to always snap to horizon control if it exists, uncomment next line
+            # if horizon_ctrl: loc_h2.z = horizon_ctrl.location.z
+        else: # If creating new H VP and horizon control exists, place it on that horizon
+            if horizon_ctrl: loc_h2.z = horizon_ctrl.location.z
+
+        # --- VP V ---
+        vp_v1_name = v_pref + "_1"
+        vp_v1_obj = bpy.data.objects.get(vp_v1_name)
+        # Default V VP location: X centered between H VPs, Y at their average, Z below H1 (or a fixed offset)
+        avg_h_vp_x = (loc_h1.x + loc_h2.x) / 2.0
+        avg_h_vp_y = (loc_h1.y + loc_h2.y) / 2.0 # Consider Y as well
+        default_v_vp_z = loc_h1.z - 10 # Default below H1's current Z
+        
+        loc_v1 = Vector((avg_h_vp_x, avg_h_vp_y, default_v_vp_z))
+        if vp_v1_obj:
+            loc_v1 = vp_v1_obj.location.copy() # Preserve existing V VP location fully
+
+        defs = [
+            {"name": vp_h1_name, "loc": loc_h1, "color": ts.three_point_vp_h1_empty_color},
+            {"name": vp_h2_name, "loc": loc_h2, "color": ts.three_point_vp_h2_empty_color},
+            {"name": vp_v1_name, "loc": loc_v1, "color": ts.three_point_vp_v_empty_color}
+        ]
+        
+        any_vp_created_or_moved = False
+        for d_def in defs:
+            existing_vp = bpy.data.objects.get(d_def["name"])
+            if not existing_vp:
+                add_vp_empty_if_missing(context, d_def["name"], d_def["loc"], d_def["color"])
+                any_vp_created_or_moved = True
+            else:
+                # Update color, and only update location if it's a new default (which it isn't here if exists)
+                # or if a specific snapping logic is re-applied (e.g. H VPs to horizon)
+                # For full freedom, we only update color if it exists.
+                # However, if the user moves the Horizon Control, we MIGHT want H VPs to follow.
+                # This is a design choice. Current logic: preserve user's manual placement.
+                if existing_vp.color != Vector(d_def["color"]): # Comparing Vector(color) to list
+                    existing_vp.color = list(d_def["color"])
+                    any_vp_created_or_moved = True # Technically only color changed, but can trigger redraws
+
+                # Optional: If you want H VPs to *always* snap to the horizon control if it's moved by user:
+                # if d_def["name"].startswith(h_pref) and horizon_ctrl:
+                #     if abs(existing_vp.location.z - horizon_ctrl.location.z) > 0.001:
+                #         existing_vp.location.z = horizon_ctrl.location.z
+                #         any_vp_created_or_moved = True
+
+
+        if any_vp_created_or_moved: # Or if VP colors changed
+            update_vp_empty_colors(ts, context) # Update all VP colors based on settings
+        
+        # Horizon line for 3P mode should be drawn between H_VP1 and H_VP2
+        # This means update_dynamic_horizon_line_curve will use their current Z values.
+        update_dynamic_horizon_line_curve(context)
+
+
+    def execute(self, context):
+        PERSPECTIVE_OT_create_3p_vps_if_needed.create_default_three_point_vps(context)
+        return {'FINISHED'}
+
+
+class PERSPECTIVE_OT_generate_3p_h1_lines(Operator):
+    bl_idname = "perspective_splines.generate_3p_h1_lines"
+    bl_label = "Generate 3P H-VP1 Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        bpy.ops.perspective_splines.create_3p_vps_if_needed() # Ensure VPs exist
+
+        vps_h = get_vanishing_points('THREE_POINT_H')
+        if not vps_h:
+            self.report({'ERROR'}, "3P H-VP1 not found. Create VPs first."); return {'CANCELLED'}
+        vp_h1 = vps_h[0] # Assumes sorted, VP_3P_H_1
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["3P_Guides_H1"]) # Clear only H1 lines
+        ext = ts.three_point_line_extension
+        
+        lines_data = generate_radial_lines_in_plane(vp_h1.location.copy(), ts.three_point_vp_h1_density, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No H1 lines to generate."); return {'FINISHED'}
+        
+        opac = ts.guide_curves_opacity
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"3P_Guides_H1_{i+1}", [pts_list], guides_coll, ts.guide_curves_thickness, opac):
+                created_count += 1
+        self.report({'INFO'}, f"Generated {created_count} 3P H-VP1 lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_generate_3p_h2_lines(Operator):
+    bl_idname = "perspective_splines.generate_3p_h2_lines"
+    bl_label = "Generate 3P H-VP2 Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        bpy.ops.perspective_splines.create_3p_vps_if_needed()
+
+        vps_h = get_vanishing_points('THREE_POINT_H')
+        if len(vps_h) < 2:
+            self.report({'ERROR'}, "3P H-VP2 not found. Create VPs first."); return {'CANCELLED'}
+        vp_h2 = vps_h[1] # Assumes sorted, VP_3P_H_2
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["3P_Guides_H2"])
+        ext = ts.three_point_line_extension
+        
+        lines_data = generate_radial_lines_in_plane(vp_h2.location.copy(), ts.three_point_vp_h2_density, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No H2 lines to generate."); return {'FINISHED'}
+
+        opac = ts.guide_curves_opacity
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"3P_Guides_H2_{i+1}", [pts_list], guides_coll, ts.guide_curves_thickness, opac):
+                created_count +=1
+        self.report({'INFO'}, f"Generated {created_count} 3P H-VP2 lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_generate_3p_v_lines(Operator):
+    bl_idname = "perspective_splines.generate_3p_v_lines"
+    bl_label = "Generate 3P V-VP Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        bpy.ops.perspective_splines.create_3p_vps_if_needed()
+
+        vps_v = get_vanishing_points('THREE_POINT_V')
+        if not vps_v:
+            self.report({'ERROR'}, "3P V-VP not found. Create VPs first."); return {'CANCELLED'}
+        vp_v1 = vps_v[0]
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["3P_Guides_V"])
+        ext = ts.three_point_line_extension
+
+        lines_data = generate_radial_lines_in_plane(vp_v1.location.copy(), ts.three_point_vp_v_density, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No V lines to generate."); return {'FINISHED'}
+
+        opac = ts.guide_curves_opacity
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"3P_Guides_V_{i+1}", [pts_list], guides_coll, ts.guide_curves_thickness, opac):
+                created_count +=1
+        self.report({'INFO'}, f"Generated {created_count} 3P V-VP lines.")
+        update_dynamic_horizon_line_curve(context) # V-VP doesn't define horizon, but good to update
+        return {'FINISHED'}    
+
+
+# (This class is after the 3P line generation operators and before align_camera)
+
+class PERSPECTIVE_OT_generate_fish_eye_splines(Operator):
+    bl_idname = "perspective_splines.generate_fish_eye"
+    bl_label = "Generate FE Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def create_default_fish_eye_center(cls, context):
+        print("DEBUG FishEye: create_default_fish_eye_center CALLED")
+        ts = context.scene.perspective_tool_settings_splines
+        helpers_coll = get_helpers_collection(context) # Ensure helpers collection exists
+
+        fe_vp_name = VP_TYPE_SPECIFIC_PREFIX_MAP['FISH_EYE'] + "_1" # e.g., VP_FE_Center_1
+        
+        # Determine color for the VP empty
+        vp_color = (0.5, 0.2, 0.8, 1.0) # Default if property doesn't exist
+        if hasattr(ts, 'fish_eye_vp_empty_color'):
+            vp_color = list(ts.fish_eye_vp_empty_color)
+        
+        existing_vp = bpy.data.objects.get(fe_vp_name)
+        
+        if existing_vp:
+            print(f"DEBUG FishEye: VP {fe_vp_name} exists. Preserving location: {existing_vp.location}")
+            # Ensure it's in the correct collection
+            if existing_vp.name not in helpers_coll.objects:
+                for coll in existing_vp.users_collection:
+                    if coll != helpers_coll:
+                        coll.objects.unlink(existing_vp)
+                helpers_coll.objects.link(existing_vp)
+            
+            # Update color if different from setting
+            current_color_tuple = tuple(round(c, 4) for c in existing_vp.color)
+            setting_color_tuple = tuple(round(c, 4) for c in vp_color)
+            if current_color_tuple != setting_color_tuple:
+                print(f"DEBUG FishEye: Updating color for existing VP {existing_vp.name}")
+                existing_vp.color = vp_color # Already a list or tuple
+                update_vp_empty_colors(ts, context) # Call master color update
+        else:
+            # VP does not exist, create it at world origin (user can move it)
+            default_loc = Vector((0.0, 0.0, 0.0))
+            print(f"DEBUG FishEye: Creating NEW VP: {fe_vp_name} at {default_loc}")
+            new_vp = add_vp_empty_if_missing(context, fe_vp_name, default_loc, vp_color)
+            if new_vp:
+                update_vp_empty_colors(ts, context) # Call master color update
+            else:
+                print(f"DEBUG FishEye: FAILED to create VP {fe_vp_name}")
+        
+        # FishEye typically doesn't have a horizon line in the same way,
+        # but call update_dynamic_horizon_line_curve anyway in case it has a default behavior for 'NONE'
+        # or if other types of horizon logic might apply. It will hide if no points are set.
+        update_dynamic_horizon_line_curve(context)
+
+
+    def execute(self, context):
+        print("DEBUG FishEye: Execute operator CALLED")
+        ts = context.scene.perspective_tool_settings_splines
+        
+        # Ensure the center VP exists or is created
+        PERSPECTIVE_OT_generate_fish_eye_splines.create_default_fish_eye_center(context)
+        
+        fe_centers = get_vanishing_points('FISH_EYE') 
+        if not fe_centers: 
+            print("DEBUG FishEye Execute: FE Center VP NOT found after attempting creation.")
+            self.report({'ERROR'}, "FE Center VP not found. Cannot generate lines."); return {'CANCELLED'}
+        
+        fe_center_obj = fe_centers[0] # Should be VP_FE_Center_1
+        print(f"DEBUG FishEye Execute: Using FE Center VP: {fe_center_obj.name} at {fe_center_obj.location}")
+        
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["FE_Guides_"]) # Clear only FE guides (added underscore)
+        
+        center_loc = fe_center_obj.location.copy() # Use the current location of the VP
+        n_lon, n_lat = ts.fish_eye_grid_radial, ts.fish_eye_grid_concentric
+        segs, radius, h_scale = ts.fish_eye_segments_per_curve, ts.fish_eye_grid_radius, ts.fish_eye_horizontal_scale
+        curves_data_to_create = [] 
+
+        print(f"DEBUG FishEye Execute: n_lon={n_lon}, n_lat={n_lat}, draw_latitude={ts.fish_eye_draw_latitude}, radius={radius}")
+
+        if n_lon > 0 and segs > 1: 
+            print(f"DEBUG FishEye Execute: Generating {n_lon} longitude lines...")
+            for i in range(n_lon):
+                phi = (2 * math.pi * i) / n_lon 
+                pts_longitude = []
+                for j in range(segs + 1): 
+                    theta = math.pi * j / segs 
+                    x = radius * math.sin(theta) * math.cos(phi) * h_scale
+                    y = radius * math.sin(theta) * math.sin(phi) 
+                    z = radius * math.cos(theta)
+                    # Add to the VP's current location
+                    pts_longitude.append(center_loc + Vector((x,y,z))) 
+                curves_data_to_create.append({'points_list': [pts_longitude], 'is_cyclic': False, 'name_suffix': f"Lon_{i}"})
+        
+        if ts.fish_eye_draw_latitude and n_lat > 0 and segs > 1: 
+            print(f"DEBUG FishEye Execute: Generating {n_lat} latitude lines...")
+            for i in range(1, n_lat + 1): 
+                theta = math.pi * i / (n_lat + 1) 
+                ring_radius_at_z = radius * math.sin(theta)
+                z_offset_from_center = radius * math.cos(theta)
+                pts_latitude = []
+                for j in range(segs + 1): 
+                    phi = (2 * math.pi * j) / segs 
+                    x = ring_radius_at_z * math.cos(phi) * h_scale
+                    y = ring_radius_at_z * math.sin(phi)
+                    z_coord = z_offset_from_center # This is relative to the sphere's own center
+                    # Add to the VP's current location
+                    pts_latitude.append(center_loc + Vector((x,y,z_coord)))
+                curves_data_to_create.append({'points_list': [pts_latitude], 'is_cyclic': True, 'name_suffix': f"Lat_{i}"})
+        
+        if not curves_data_to_create: 
+            print("DEBUG FishEye Execute: No curve data was generated for FE lines.")
+            self.report({'INFO'}, "No Fish Eye lines to generate based on current settings."); return {'FINISHED'}
+        
+        print(f"DEBUG FishEye Execute: Attempting to create {len(curves_data_to_create)} FE curve objects.")
+        opac = ts.guide_curves_opacity 
+        thickness = ts.guide_curves_thickness
+        created_count = 0
+        for i, curve_def in enumerate(curves_data_to_create):
+            obj_name = f"FE_Guides_{curve_def['name_suffix']}"
+            # create_curve_object uses random colors by default if color_rgb is not passed
+            if create_curve_object(context, obj_name, curve_def['points_list'], guides_coll,
+                                thickness, opac, is_cyclic=curve_def['is_cyclic'], curve_type='BEZIER'):
+                created_count +=1
+        
+        self.report({'INFO'}, f"Generated {created_count} Fish Eye line objects.")
+        return {'FINISHED'}
+
+class PERSPECTIVE_OT_align_camera_splines(Operator):
+    bl_idname = "perspective_splines.align_camera"
+    bl_label = "Align Camera to Perspective"
+    bl_options = {'REGISTER', 'UNDO'}
+    @classmethod
+    def poll(cls, context): return context.scene.camera is not None
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        cam = context.scene.camera
+        if not cam: # Should be caught by poll, but defensive
+            self.report({'ERROR'}, "No active camera in scene.")
+            return {'CANCELLED'}
+
+        target_point = Vector((0,0,0)) # Point camera looks at
+        cam_height_origin_z = 0.0 # Z level from which eye height is measured
+
+        curr_type = ts.current_perspective_type
+        horizon_ctrl = get_horizon_control_object()
+
+        if curr_type == 'ONE_POINT':
+            vps = get_vanishing_points('ONE_POINT')
+            if vps: 
+                target_point = vps[0].location.copy()
+                cam_height_origin_z = vps[0].location.z
+            elif horizon_ctrl: 
+                cam_height_origin_z = horizon_ctrl.location.z
+                target_point = Vector((0, 0, cam_height_origin_z)) # Target center of horizon
+            else: # Fallback to tool setting
+                cam_height_origin_z = ts.horizon_y_level
+                target_point = Vector((0, 0, cam_height_origin_z))
+
+        elif curr_type == 'TWO_POINT':
+            vps = get_vanishing_points('TWO_POINT')
+            if len(vps) >=2: 
+                target_point = (vps[0].location + vps[1].location) / 2.0
+                cam_height_origin_z = vps[0].location.z # VPs are on horizon
+            elif horizon_ctrl:
+                cam_height_origin_z = horizon_ctrl.location.z
+                target_point = Vector((0, 0, cam_height_origin_z))
+            else:
+                cam_height_origin_z = ts.horizon_y_level
+                target_point = Vector((0, 0, cam_height_origin_z))
+        
+        elif curr_type == 'THREE_POINT':
+            vps_h = get_vanishing_points('THREE_POINT_H')
+            # For 3P, typically target the center of the H_VPs on the horizon
+            if len(vps_h) >=2: 
+                target_point = (vps_h[0].location + vps_h[1].location) / 2.0
+                cam_height_origin_z = vps_h[0].location.z
+                # Optional: Could consider V_VP for target_point.z if desired for worm's/bird's eye view aiming
+                # vps_v = get_vanishing_points('THREE_POINT_V')
+                # if vps_v: target_point.z = vps_v[0].location.z 
+            elif horizon_ctrl:
+                cam_height_origin_z = horizon_ctrl.location.z
+                target_point = Vector((0, 0, cam_height_origin_z))
+            else:
+                cam_height_origin_z = ts.horizon_y_level
+                target_point = Vector((0, 0, cam_height_origin_z))
+
+        elif curr_type == 'FISH_EYE':
+            vps = get_vanishing_points('FISH_EYE')
+            if vps: 
+                target_point = vps[0].location.copy()
+                cam_height_origin_z = vps[0].location.z # Camera level relative to FE center Z
+            else: # Fallback to world origin if no FE center
+                target_point = Vector((0,0,0))
+                cam_height_origin_z = 0.0
+        
+        else: # 'NONE' or unhandled type
+            if horizon_ctrl: 
+                cam_height_origin_z = horizon_ctrl.location.z
+                target_point = Vector((0, 0, cam_height_origin_z))
+            else: 
+                cam_height_origin_z = ts.horizon_y_level
+                target_point = Vector((0, 0, cam_height_origin_z))
+            self.report({'INFO'}, f"Aligning camera to default target at Z={cam_height_origin_z:.2f}.")
+
+        # Position camera: typically behind target_point along Y, at eye height
+        # Assuming standard Blender coordinate system where -Y is "into the screen" from front view
+        cam.location = target_point + Vector((0, -ts.camera_distance, 0)) # Move back along Y
+        cam.location.z = cam_height_origin_z + ts.camera_eye_height       # Set Z based on origin + eye height
+
+        # Point camera towards target_point
+        direction_to_target = target_point - cam.location
+        if direction_to_target.length > 0.0001: # Avoid issues with zero-length vector
+            # Using 'track_to_object_tuple' logic: (target_object, track_axis, up_axis)
+            # We want camera's -Z axis to point towards target, Y axis as up.
+            cam.rotation_euler = direction_to_target.to_track_quat('-Z', 'Y').to_euler('XYZ')
+        
+        self.report({'INFO'}, f"Camera aligned for {curr_type if curr_type != 'NONE' else 'default view'}.")
+        return {'FINISHED'}
+
+# This operator is now redundant if PERSPECTIVE_OT_merge_and_convert_to_gpencil is used from the UI.
+# It's commented out in classes_splines. If you want to keep it for other purposes, ensure its context override is also robust.
+# (This operator should be around line 1067 or after PERSPECTIVE_OT_align_camera_splines)
+# Replace the existing PERSPECTIVE_OT_convert_to_grease_pencil with this:
+
+# -----------------------------------------------------------
+# UI Panel
+# -----------------------------------------------------------
+# -----------------------------------------------------------
+# UI Panel
+# -----------------------------------------------------------
+# (This class is usually defined after all your operators and before the registration section)
+
+class VIEW3D_PT_rogue_perspective_grids(Panel):
+    bl_label = "Construction Grids"
+    bl_idname = "VIEW3D_PT_rogue_perspective_grids"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'RogueAI' # Same tab as main panel
+    bl_parent_id = "VIEW3D_PT_rogue_perspective_ai" # Make it a subpanel
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        ts = context.scene.perspective_tool_settings_splines
+
+        box = layout.box()
+        box.label(text="Box Grid Parameters:")
+        col = box.column(align=True)
+        col.prop(ts, "grid_center", text="Center")
+        col.prop(ts, "grid_size", text="Size")
+        row = col.row(align=True)
+        row.prop(ts, "grid_subdivisions_u", text="Subs U")
+        row.prop(ts, "grid_subdivisions_v", text="Subs V")
+
+        box.separator()
+        box.label(text="Draw Planes:")
+        col_planes = box.column(align=True)
+        row1 = col_planes.row(align=True)
+        row1.prop(ts, "grid_draw_front", text="Front", toggle=True)
+        row1.prop(ts, "grid_draw_back", text="Back", toggle=True)
+        row2 = col_planes.row(align=True)
+        row2.prop(ts, "grid_draw_top", text="Top", toggle=True)
+        row2.prop(ts, "grid_draw_bottom", text="Bottom", toggle=True)
+        row3 = col_planes.row(align=True)
+        row3.prop(ts, "grid_draw_left", text="Left", toggle=True)
+        row3.prop(ts, "grid_draw_right", text="Right", toggle=True)
+        
+        layout.separator()
+        layout.operator("perspective_splines.create_box_grid", text="Create/Update Box Grid", icon='MESH_GRID')
+        
+        # Corrected Clear Grid Planes button
+        layout.operator("perspective_splines.clear_grid_planes", text="Clear Grid Planes", icon='X')
+        
+        layout.separator() 
+        
+        # Added Toggle Grid Visibility button
+        toggle_op = layout.operator(
+            PERSPECTIVE_OT_toggle_guide_visibility.bl_idname,
+            text="Toggle Grid Visibility",
+            icon='HIDE_OFF' # Initial icon, can be made dynamic if state is tracked
+        )
+        toggle_op.group_prefix = "GridPlane_"
+
+
+class PERSPECTIVE_OT_trim_guides_to_camera(Operator):
+    bl_idname = "perspective_splines.trim_guides_to_camera"
+    bl_label = "Adjust Line Start/End to Camera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    search_steps: IntProperty(
+        name="Search Detail",
+        description="Number of steps to search along lines for camera borders.",
+        default=200, min=50, max=1000
+    )
+    scan_distance_from_vp: FloatProperty(
+        name="Scan Distance from VP (World Units)",
+        description="Max distance to scan along lines from VP (in both directions) for view intersection.",
+        default=1500.0, min=10.0, max=50000.0
+    )
+
+    @staticmethod
+    def get_camera_view_info(scene, cam):
+        if not scene or not cam or not cam.data:
+            return None
+        return {'min_x': 0.0, 'max_x': 1.0, 'min_y': 0.0, 'max_y': 1.0, 'char_length_for_norm': 1.0}
+
+    @staticmethod
+    def world_to_cam_normalized(scene, cam, world_coord):
+        try:
+            if not isinstance(world_coord, Vector):
+                world_coord_vec = Vector(world_coord)
+            else:
+                world_coord_vec = world_coord
+            return world_to_camera_view(scene, cam, world_coord_vec)
+        except Exception:
+            return Vector((-1, -1, -1))
+
+    @staticmethod
+    def is_point_in_cam_space(cam_coords, min_x=0.0, max_x=1.0, min_y=0.0, max_y=1.0, marginVal=0.0):
+        if cam_coords.z <= 0:
+            return False
+        return (min_x + marginVal <= cam_coords.x <= max_x - marginVal and
+                min_y + marginVal <= cam_coords.y <= max_y - marginVal)
+
+    def get_camera_and_context_override(self, context):
+        cam = None
+        area_for_op = None
+        view_region = None
+        active_window = context.window
+        if context.area and context.area.type == 'VIEW_3D':
+            rv3d = context.area.spaces.active.region_3d
+            if rv3d and rv3d.view_perspective == 'CAMERA':
+                cam_obj_from_rv3d = rv3d.camera_object if rv3d.camera_object else context.scene.camera
+                if cam_obj_from_rv3d:
+                    cam = cam_obj_from_rv3d
+                    area_for_op = context.area
+                    for r in area_for_op.regions:
+                        if r.type == 'WINDOW':
+                            view_region = r
+                            break
+                    if view_region:
+                        return cam, area_for_op, view_region
+        if not cam:
+            cam = context.scene.camera
+        if cam and not (area_for_op and view_region):
+            for area_iter in active_window.screen.areas:
+                if area_iter.type == 'VIEW_3D':
+                    area_for_op = area_iter
+                    for r_iter in area_iter.regions:
+                        if r_iter.type == 'WINDOW':
+                            view_region = r_iter
+                            break
+                    if view_region:
+                        break
+        if cam and area_for_op and view_region:
+            return cam, area_for_op, view_region
+        return None, None, None
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+
+        cam, area_for_op, view_region = self.get_camera_and_context_override(context)
+        if not cam:
+            self.report({'WARNING'}, "No active camera.")
+            return {'CANCELLED'}
+        if not area_for_op or not view_region:
+            self.report({'WARNING'}, "No suitable 3D View.")
+            return {'CANCELLED'}
+
+        guides_coll = get_guides_collection(context)
+        if not guides_coll:
+            self.report({'INFO'}, "Guides collection not found.")
+            return {'CANCELLED'}
+
+        view_info = self.get_camera_view_info(context.scene, cam)
+        if not view_info:
+            self.report({'ERROR'}, "Could not get camera view info.")
+            return {'CANCELLED'}
+
+        lines_adjusted, objects_removed_count = 0, 0
+        override = {'scene': context.scene, 'region': view_region, 'area': area_for_op, 'space_data': area_for_op.spaces.active}
+        object_list_copy = list(guides_coll.objects)
+        objects_to_remove_indices = []
+
+        scan_dist = self.scan_distance_from_vp
+
+        for obj_idx, obj in enumerate(object_list_copy):
+            if not obj or obj.name not in bpy.data.objects:
+                continue
+            if obj.type != 'CURVE' or obj.name == HORIZON_CURVE_OBJ_NAME or not obj.data or not obj.data.splines:
+                continue
+            if obj.name.startswith("GridPlane_"):
+                continue
+
+            obj_matrix_world = obj.matrix_world
+            obj_matrix_world_inv = obj_matrix_world.inverted()
+            new_splines_data_for_object = []
+            made_change_to_this_object_splines = False
+
+            with context.temp_override(**override):
+                for spline in obj.data.splines:
+                    if not (spline.type == 'POLY' and len(spline.points) >= 2):
+                        if spline.type == 'BEZIER':
+                            new_splines_data_for_object.append({'type': 'BEZIER', 'points_data': [(bp.handle_left.copy(), bp.co.copy(), bp.handle_right.copy()) for bp in spline.bezier_points], 'cyclic': spline.use_cyclic_u})
+                        elif spline.type == 'POLY':
+                            new_splines_data_for_object.append({'type': 'POLY', 'points_data': [p.co.copy() for p in spline.points], 'cyclic': spline.use_cyclic_u})
+                        continue
+
+                    p0_local_orig_w1 = spline.points[0].co.copy()
+                    p1_local_orig_w1 = spline.points[-1].co.copy()
+                    vp_world = obj_matrix_world @ p0_local_orig_w1.xyz
+                    original_guide_end_world = obj_matrix_world @ p1_local_orig_w1.xyz
+                    direction_world = original_guide_end_world - vp_world
+
+                    if direction_world.length < 1e-5:
+                        vp_cam_norm = self.world_to_cam_normalized(context.scene, cam, vp_world)
+                        if self.is_point_in_cam_space(vp_cam_norm, marginVal=ts.trim_view_margin):
+                            new_splines_data_for_object.append({'type': 'POLY', 'points_data': [p0_local_orig_w1, p1_local_orig_w1], 'cyclic': False})
+                        continue
+
+                    direction_world_norm = direction_world.normalized()
+                    entry_on_margin_world = None
+                    exit_on_margin_world = None
+                    last_p_world = None
+                    last_in_margin = None
+
+                    # --- Improved scan/interpolation for border detection ---
+                    for i in range(self.search_steps + 1):
+                        current_t = -scan_dist + (i / self.search_steps) * (2 * scan_dist)
+                        current_p_world = vp_world + direction_world_norm * current_t
+                        current_p_cam = self.world_to_cam_normalized(context.scene, cam, current_p_world)
+                        is_currently_in_margin = self.is_point_in_cam_space(current_p_cam, marginVal=ts.trim_view_margin)
+
+                        if last_in_margin is not None and is_currently_in_margin != last_in_margin:
+                            # Interpolate to find the border crossing
+                            p0_world = last_p_world
+                            p1_world = current_p_world
+                            for interp in range(1, 11):
+                                alpha = interp / 10.0
+                                interp_world = p0_world.lerp(p1_world, alpha)
+                                interp_cam = self.world_to_cam_normalized(context.scene, cam, interp_world)
+                                interp_in_margin = self.is_point_in_cam_space(interp_cam, marginVal=ts.trim_view_margin)
+                                if interp_in_margin == is_currently_in_margin:
+                                    if is_currently_in_margin:
+                                        entry_on_margin_world = interp_world
+                                    else:
+                                        exit_on_margin_world = interp_world
+                                    break
+
+                        if is_currently_in_margin and entry_on_margin_world is None:
+                            entry_on_margin_world = current_p_world
+                        if is_currently_in_margin:
+                            exit_on_margin_world = current_p_world
+
+                        last_p_world = current_p_world
+                        last_in_margin = is_currently_in_margin
+
+                    final_p_start_world, final_p_end_world = None, None
+                    processed_by_margin_logic = False
+
+                    # --- Main: If line crosses the camera view, trim to entry/exit and extend further into view ---
+                    if entry_on_margin_world and exit_on_margin_world and (exit_on_margin_world - entry_on_margin_world).length > 1e-5:
+                        segment_vec = exit_on_margin_world - entry_on_margin_world
+                        segment_length = segment_vec.length
+                        start_p = entry_on_margin_world + segment_vec * ts.trim_start_percent
+                        end_p = entry_on_margin_world + segment_vec * ts.trim_end_percent
+                        final_p_start_world = start_p
+                        final_p_end_world = end_p
+                        processed_by_margin_logic = True
+
+                    # --- If not, check proximity to camera view and keep if close enough ---
+                    if not processed_by_margin_logic:
+                        min_dist = float('inf')
+                        closest_world = None
+                        for i in range(self.search_steps + 1):
+                            t = -scan_dist + (i / self.search_steps) * (2 * scan_dist)
+                            p_world = vp_world + direction_world_norm * t
+                            p_cam = self.world_to_cam_normalized(context.scene, cam, p_world)
+                            if p_cam.z > 0:
+                                dx = max(0, view_info['min_x'] - p_cam.x, p_cam.x - view_info['max_x'])
+                                dy = max(0, view_info['min_y'] - p_cam.y, p_cam.y - view_info['max_y'])
+                                dist = (dx ** 2 + dy ** 2) ** 0.5
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    closest_world = p_world
+                        # Use the new keep-near-border property
+                        if min_dist <= ts.trim_keep_near_border_distance and closest_world is not None:
+                            min_len = max(ts.trim_min_visible_segment_length, 0.01)
+                            final_p_start_world = closest_world
+                            final_p_end_world = closest_world + direction_world_norm * min_len
+                            processed_by_margin_logic = True
+                        elif ts.trim_delete_lines_outside_strict_view and min_dist > ts.trim_deletion_distance_threshold:
+                            # Only delete if far away
+                            pass
+
+                    # Only keep lines that cross the camera view or are close enough
+                    if final_p_start_world and final_p_end_world:
+                        segment_vector = final_p_end_world - final_p_start_world
+                        if segment_vector.dot(direction_world_norm) > 1e-6:
+                            if segment_vector.length >= ts.trim_min_visible_segment_length:
+                                p_s_loc = (obj_matrix_world_inv @ final_p_start_world).to_4d()
+                                p_e_loc = (obj_matrix_world_inv @ final_p_end_world).to_4d()
+                                new_splines_data_for_object.append({'type': 'POLY', 'points_data': [p_s_loc, p_e_loc], 'cyclic': False})
+                                if (p_s_loc - p0_local_orig_w1).length > 1e-4 or (p_e_loc - p1_local_orig_w1).length > 1e-4:
+                                    made_change_to_this_object_splines = True
+
+            if not new_splines_data_for_object:
+                objects_to_remove_indices.append(obj_idx)
+            elif made_change_to_this_object_splines or len(new_splines_data_for_object) != len(obj.data.splines):
+                obj.data.splines.clear()
+                for s_data in new_splines_data_for_object:
+                    new_spline = obj.data.splines.new(type=s_data['type'])
+                    if s_data['type'] == 'POLY':
+                        if len(s_data['points_data']) >= 1:
+                            new_spline.points.add(len(s_data['points_data']) - 1)
+                            for i, pt_co4d in enumerate(s_data['points_data']):
+                                new_spline.points[i].co = pt_co4d
+                    elif s_data['type'] == 'BEZIER':
+                        if len(s_data['points_data']) > 0:
+                            new_spline.bezier_points.add(len(s_data['points_data']) - 1)
+                            for i, bp_data_tuple in enumerate(s_data['points_data']):
+                                bp = new_spline.bezier_points[i]
+                                bp.handle_left, bp.co, bp.handle_right = bp_data_tuple
+                                bp.handle_left_type = 'AUTO'
+                                bp.handle_right_type = 'AUTO'
+                    new_spline.use_cyclic_u = s_data['cyclic']
+                obj.data.update_tag()
+                lines_adjusted += 1
+
+        if objects_to_remove_indices:
+            for obj_idx_to_remove in sorted(objects_to_remove_indices, reverse=True):
+                obj_to_remove = object_list_copy[obj_idx_to_remove]
+                if obj_to_remove and obj_to_remove.name in bpy.data.objects:
+                    obj_data = obj_to_remove.data
+                    for coll in obj_to_remove.users_collection:
+                        coll.objects.unlink(obj_to_remove)
+                    bpy.data.objects.remove(obj_to_remove, do_unlink=False)
+                    if obj_data and obj_data.users == 0:
+                        try:
+                            if isinstance(obj_data, bpy.types.Curve):
+                                bpy.data.curves.remove(obj_data)
+                        except Exception as e:
+                            print(f"Error removing orphaned curve data: {e}")
+                    objects_removed_count += 1
+
+        report_parts = []
+        if lines_adjusted > 0:
+            report_parts.append(f"Adjusted {lines_adjusted} guide objects")
+        if objects_removed_count > 0:
+            report_parts.append(f"Removed {objects_removed_count} objects")
+        self.report({'INFO'}, ". ".join(report_parts) + "." if report_parts else "No guide lines required adjustment or removal based on current settings.")
+        return {'FINISHED'}
+
+    
+
+class VIEW3D_PT_rogue_perspective_trimmer(Panel):
+    bl_label = "Guide Trimmer / Adjust Length"
+    bl_idname = "VIEW3D_PT_rogue_perspective_trimmer"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'RogueAI'
+    bl_parent_id = "VIEW3D_PT_rogue_perspective_ai"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        ts = getattr(context.scene, "perspective_tool_settings_splines", None)
+        if not ts:
+            layout.label(text="Trimmer settings not found.")
+            return
+
+        main_box = layout.box()
+        col_main = main_box.column()
+
+        # --- Automatic Adjustment ---
+        col_main.label(text="Automatic Camera Trim:")
+        col_main.operator(
+            PERSPECTIVE_OT_trim_guides_to_camera.bl_idname,
+            text="Auto-Trim Lines to Camera",
+            icon='MOD_LENGTH'
+        )
+        col_main.separator()
+
+        # --- Trim Settings (for both auto and manual) ---
+        col_main.label(text="Trim Settings:")
+        param_box = col_main.box()
+        param_col = param_box.column(align=True)
+        param_col.prop(ts, "trim_view_margin", text="View Margin")
+        param_col.prop(ts, "trim_keep_near_border_distance", text="Keep Near Border")
+        param_col.prop(ts, "trim_min_visible_segment_length", text="Min Segment Length")
+        param_col.prop(ts, "trim_start_percent", text="Start % Inside")
+        param_col.prop(ts, "trim_end_percent", text="End % Inside")
+        col_main.separator()
+
+        # --- Culling options ---
+        culling_box = col_main.box()
+        culling_col = culling_box.column(align=True)
+        culling_col.prop(ts, "trim_delete_lines_outside_strict_view", text="Delete Only Far Lines")
+        if ts.trim_delete_lines_outside_strict_view:
+            culling_col.prop(ts, "trim_deletion_distance_threshold", text="Deletion Distance Threshold")
+
+        col_main.separator()
+
+        # --- Manual Fine-Tune Section ---
+        col_main.label(text="Manual Fine-Tune:")
+        col_main.operator(
+            PERSPECTIVE_OT_trim_guides_to_camera.bl_idname,
+            text="Apply Manual Adjustments",
+            icon='MOD_LENGTH'
+        )
+        col_main.separator()
+
+        # F9/Redo info
+        f9_box = col_main.box()
+        f9_col = f9_box.column(align=True)
+        f9_col.label(text="Fine-tune with F9 (Redo Last):")
+        f9_col.label(text="- Search Detail, Scan Radius")
+
+
+
+class Rogue_Perspective_AI_PT_main(Panel):
+    bl_label = "Rogue Perspective AI"
+    bl_idname = "VIEW3D_PT_rogue_perspective_ai"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'RogueAI' # This will be the tab name in the N-Panel
+
+    @classmethod
+    def poll(cls, context):
+        # Ensure the settings property group is available on the scene
+        return hasattr(context.scene, "perspective_tool_settings_splines") and \
+               context.scene.perspective_tool_settings_splines is not None
+
+    # --- Helper method for the Finalize Guides section ---
+    def draw_finalize_guides_section(self, layout, context):
+        tool_settings = context.scene.perspective_tool_settings_splines
+        current_perspective_type = tool_settings.current_perspective_type
+
+        finalize_box = layout.box()
+        finalize_box.label(text="Finalize Guides:")
+
+        if  current_perspective_type != 'NONE' and \
+            current_perspective_type in PERSPECTIVE_OT_merge_specific_guides.GUIDE_GROUP_DEFS:
+        
+            type_specific_merge_box = finalize_box.box()
+            # ... (selective merge buttons as before) ...
+            guide_groups_for_type = PERSPECTIVE_OT_merge_specific_guides.GUIDE_GROUP_DEFS[current_perspective_type]
+            # (Loop to create specific merge buttons remains the same)
+            for group_id_key, (_, name_suggestion_part) in guide_groups_for_type.items():
+                label_text = name_suggestion_part.replace(current_perspective_type.replace('_',''), "").replace("_Lines", "").replace("Lines","").replace("_", " ").strip().title()
+                if not label_text: label_text = group_id_key.replace("_LINES", "").replace("_", " ").strip().title()
+                op = type_specific_merge_box.operator(PERSPECTIVE_OT_merge_specific_guides.bl_idname, text=f"Merge {label_text}")
+                op.group_identifier = group_id_key
+        
+            op_all_current = type_specific_merge_box.operator(PERSPECTIVE_OT_merge_specific_guides.bl_idname, text=f"Merge All {current_perspective_type.replace('_', ' ').title()} Guides")
+            op_all_current.group_identifier = "ALL_CURRENT_TYPE"
+
+        finalize_box.separator()
+        finalize_box.operator(PERSPECTIVE_OT_merge_guides.bl_idname, icon='OBJECT_DATAMODE') # "Merge All Visible Guides"
+    
+         # --- Show/Hide Section ---
+        show_hide_box = layout.box()
+        show_hide_box.label(text="Toggle Guide Visibility:")
+        col_sh = show_hide_box.column(align=True)
+
+        # Dynamically add show/hide buttons based on current perspective type definitions
+        if current_perspective_type != 'NONE' and current_perspective_type in PERSPECTIVE_OT_merge_specific_guides.GUIDE_GROUP_DEFS:
+              guide_groups = PERSPECTIVE_OT_merge_specific_guides.GUIDE_GROUP_DEFS[current_perspective_type]
+              for group_key, (prefixes, name_part) in guide_groups.items():
+                  # Use the first prefix as representative for the toggle operator
+                  if prefixes:
+                     op_sh = col_sh.operator(PERSPECTIVE_OT_toggle_guide_visibility.bl_idname, text=f"Toggle {name_part.replace('_Lines','').replace('_',' ')}", icon='HIDE_OFF') # Icon can be dynamic later
+                     op_sh.group_prefix = prefixes[0] # e.g. "2P_Guides_VP1"
+        else:
+            col_sh.label(text="Select a perspective type to see visibility toggles.")
+        
+
+    # --- Main draw method for the panel ---
+    def draw(self, context):
+        layout = self.layout
+        
+        # Check if addon properties are initialized (poll should also catch this)
+        if not hasattr(context.scene, "perspective_tool_settings_splines") or \
+           not context.scene.perspective_tool_settings_splines:
+            layout.label(text="Error: Addon properties not fully initialized.")
+            # layout.operator("wm.operator_defaults") # Can be useful for debugging registration
+            return
+        
+        ts = context.scene.perspective_tool_settings_splines
+
+        # Mode selector
+        layout.prop(ts, "current_perspective_type", text="Mode")
+        layout.separator()
+
+        # --- Horizon Line Section ---
+        box_hz = layout.box()
+        col_hz_main = box_hz.column()
+        col_hz_main.label(text="Horizon Line (1P Setup / Visual):")
+        row_hz_ctrl = col_hz_main.row(align=True)
+        row_hz_ctrl.prop(ts, "horizon_y_level") # Uses name "1P Horizon Z"
+        row_hz_ctrl.operator("perspective_splines.generate_horizon", text="Set/Update", icon='CON_SIZELIMIT')
+        
+        col_hz_props = col_hz_main.column(align=True)
+        col_hz_props.prop(ts, "horizon_line_length")
+        col_hz_props.prop(ts, "horizon_line_thickness")
+        col_hz_props.prop(ts, "horizon_line_color", text="Color & Alpha")
+        col_hz_main.operator("perspective_splines.clear_horizon", text="Clear Horizon Elements", icon='X')
+        layout.separator()
+
+        # --- Vanishing Point Controls ---
+        box_vps = layout.box()
+        col_vps_main = box_vps.column()
+        col_vps_main.label(text="Vanishing Point Empties:")
+        row_vps_ops = col_vps_main.row(align=True)
+        row_vps_ops.operator("perspective_splines.add_vp_empty", text="Add Generic VP", icon='ADD')
+        row_vps_ops.operator("perspective_splines.remove_selected_helper_empty", text="Remove Sel. VP/Ctrl", icon='REMOVE')
+        
+        vps_list = get_vanishing_points() # Gets all VPs
+        if vps_list:
+            vp_display_box = col_vps_main.box()
+            for vp_obj in vps_list:
+                row_vp_item = vp_display_box.row(align=True)
+                row_vp_item.label(text=f"{vp_obj.name}", icon='EMPTY_DATA')
+                # Individual location properties for finer control in UI
+                loc_row = row_vp_item.row(align=True)
+                loc_row.prop(vp_obj, "location", index=0, text="X")
+                loc_row.prop(vp_obj, "location", index=1, text="Y")
+                loc_row.prop(vp_obj, "location", index=2, text="Z")
+        layout.separator()
+
+        # --- Guide Lines General Appearance (Simplified) ---
+        box_guides_app = layout.box()
+        col_guides_app_main = box_guides_app.column()
+        col_guides_app_main.label(text="Guide Lines General Appearance:")
+        col_guides_props = col_guides_app_main.column(align=True)
+        col_guides_props.prop(ts, "guide_curves_thickness")
+        col_guides_props.prop(ts, "guide_curves_opacity")
+        col_guides_app_main.operator("perspective_splines.clear_just_guides", text="Clear All Guide Lines", icon='BRUSH_DATA')
+        layout.separator()
+
+        # --- Perspective-specific Settings Panel ---
+        if ts.current_perspective_type != 'NONE':
+            type_settings_box = layout.box() 
+            # Call the appropriate draw method for the current perspective type
+            if ts.current_perspective_type == 'ONE_POINT':
+                self.draw_one_point_panel(context, type_settings_box, ts)
+            elif ts.current_perspective_type == 'TWO_POINT':
+                self.draw_two_point_panel(context, type_settings_box, ts)
+            elif ts.current_perspective_type == 'THREE_POINT':
+                self.draw_three_point_panel(context, type_settings_box, ts)
+            elif ts.current_perspective_type == 'FISH_EYE':
+                self.draw_fish_eye_panel(context, type_settings_box, ts)
+            layout.separator()
+
+        # --- Finalize Guides Section (using the new helper method) ---
+        self.draw_finalize_guides_section(layout, context)
+        layout.separator()
+
+        # --- Camera Alignment ---
+        box_cam = layout.box()
+        col_cam_main = box_cam.column()
+        col_cam_main.label(text="Camera Alignment:")
+        col_cam_props = col_cam_main.column(align=True)
+        col_cam_props.prop(ts, "camera_eye_height")
+        col_cam_props.prop(ts, "camera_distance")
+        col_cam_main.operator("perspective_splines.align_camera", icon='CAMERA_DATA')
+        layout.separator()
+        
+        # --- Master Clear Button ---
+        layout.operator("perspective_splines.clear_all", text="Clear ALL Perspective Data", icon='TRASH')
+
+    # --- Perspective-specific sub-panel drawing methods ---
+    # (These should be the same as you had before, ensure they are correctly defined within this class)
+
+    def draw_one_point_panel(self, context, box, settings): 
+        col = box.column(align=True)
+        col.label(text="One-Point Perspective Settings:")
+        col.prop(settings, "one_point_vp_empty_color", text="VP Empty Color")
+        col.separator()
+        
+        row_radial = col.row(align=True)
+        row_radial.prop(settings, "one_point_draw_radial", toggle=True)
+        if settings.one_point_draw_radial:
+            row_radial.prop(settings, "one_point_grid_density_radial", text="Density")
+        
+        row_ortho_x = col.row(align=True)
+        row_ortho_x.prop(settings, "one_point_draw_ortho_x", toggle=True)
+        if settings.one_point_draw_ortho_x:
+            row_ortho_x.prop(settings, "one_point_grid_density_ortho_x", text="Density")
+
+        row_ortho_y = col.row(align=True)
+        row_ortho_y.prop(settings, "one_point_draw_ortho_y", toggle=True)
+        if settings.one_point_draw_ortho_y:
+            row_ortho_y.prop(settings, "one_point_grid_density_ortho_y", text="Density")
+        
+        if settings.one_point_draw_ortho_x or settings.one_point_draw_ortho_y or settings.one_point_draw_radial:
+             col.prop(settings, "one_point_grid_extent", text="Grid Extent Factor")
+             col.prop(settings, "one_point_line_extension", text="Radial Line Length")
+
+        box.operator("perspective_splines.generate_one_point", text="Generate/Update 1P Lines", icon='CURVE_PATH')
+
+# Inside class Rogue_Perspective_AI_PT_main(Panel):
+
+    def draw_two_point_panel(self, context, box, settings): # 'settings' is ts
+        col = box.column(align=True)
+        col.label(text="Two-Point Perspective Settings:")
+        
+        col.label(text="VP Empty Colors:")
+        row_vp_colors = col.row(align=True)
+        row_vp_colors.prop(settings, "two_point_vp1_empty_color", text="VP1")
+        row_vp_colors.prop(settings, "two_point_vp2_empty_color", text="VP2")
+        col.separator()
+        
+        col.prop(settings, "two_point_line_extension", text="Radial Line Length")
+        col.separator()
+
+        col.label(text="Guide Densities & Parameters:")
+        
+        # VP1 Lines
+        sub_box_vp1 = col.box()
+        sub_box_vp1.label(text="VP1 Lines:")
+        sub_box_vp1.prop(settings, "two_point_grid_density_vp1", text="Density")
+        sub_box_vp1.operator("perspective_splines.generate_2p_vp1_lines", text="Draw VP1 Lines")
+
+        # VP2 Lines
+        sub_box_vp2 = col.box()
+        sub_box_vp2.label(text="VP2 Lines:")
+        sub_box_vp2.prop(settings, "two_point_grid_density_vp2", text="Density")
+        sub_box_vp2.operator("perspective_splines.generate_2p_vp2_lines", text="Draw VP2 Lines")
+        
+        # Vertical Lines
+        sub_box_vert = col.box()
+        sub_box_vert.label(text="Vertical Lines:")
+        sub_box_vert.prop(settings, "two_point_grid_density_vertical", text="Density")
+        if settings.two_point_grid_density_vertical > 0:
+            sub_box_vert.prop(settings, "two_point_verticals_x_spacing_factor", text="X Spacing")
+            sub_box_vert.prop(settings, "two_point_grid_height", text="Height")
+            sub_box_vert.prop(settings, "two_point_grid_depth_offset", text="Y Offset")
+        sub_box_vert.operator("perspective_splines.generate_2p_vertical_lines", text="Draw Vertical Lines")
+        
+        col.separator()
+        col.operator("perspective_splines.create_2p_vps_if_needed", text="Create/Refresh 2P VPs", icon='EMPTY_AXIS')
+
+    def draw_three_point_panel(self, context, box, settings): # 'settings' is ts
+        col = box.column(align=True)
+        col.label(text="Three-Point Perspective Settings:")
+    
+        col.label(text="VP Empty Colors:")
+        row_vp_colors = col.row(align=True)
+        row_vp_colors.prop(settings, "three_point_vp_h1_empty_color", text="H1")
+        row_vp_colors.prop(settings, "three_point_vp_h2_empty_color", text="H2")
+        row_vp_colors.prop(settings, "three_point_vp_v_empty_color", text="V")
+        col.separator()
+    
+        col.prop(settings, "three_point_line_extension", text="Radial Line Length")
+        col.separator()
+
+        col.label(text="Guide Densities:")
+        row_density1 = col.row(align=True)
+        row_density1.prop(settings, "three_point_vp_h1_density", text="H1 Density")
+        row_density1.prop(settings, "three_point_vp_h2_density", text="H2 Density")
+        col.prop(settings, "three_point_vp_v_density", text="V Density")
+        col.separator()
+
+        col.label(text="Generate Lines:")
+        col.operator("perspective_splines.generate_3p_h1_lines", text="Draw H-VP1 Lines", icon='CURVE_PATH')
+        col.operator("perspective_splines.generate_3p_h2_lines", text="Draw H-VP2 Lines", icon='CURVE_PATH')
+        col.operator("perspective_splines.generate_3p_v_lines", text="Draw V-VP Lines", icon='CURVE_PATH')
+    
+        # Button to create VPs if they don't exist, or refresh them.
+        col.separator()
+        col.operator("perspective_splines.create_3p_vps_if_needed", text="Create/Refresh 3P VPs", icon='EMPTY_AXIS')
+
+
+    def draw_fish_eye_panel(self, context, box, settings):
+        col = box.column(align=True)
+        col.label(text="Fish Eye (Spherical Cage) Settings:")
+        col.prop(settings, "fish_eye_grid_radius", text="Sphere Radius")
+        
+        row_grid_lines = col.row(align=True)
+        row_grid_lines.prop(settings, "fish_eye_grid_radial", text="Longitudes")
+        row_grid_lines.prop(settings, "fish_eye_grid_concentric", text="Latitudes")
+        
+        col.prop(settings, "fish_eye_segments_per_curve", text="Curve Smoothness")
+        col.prop(settings, "fish_eye_horizontal_scale", text="Horizontal Scale")
+        col.prop(settings, "fish_eye_draw_latitude", text="Draw Latitude Lines", toggle=True)
+        # fish_eye_strength is defined in properties but not used in current generation logic.
+        # If you use it later, add: col.prop(settings, "fish_eye_strength")
+        
+        box.operator("perspective_splines.generate_fish_eye", text="Generate/Update Fish Eye Lines", icon='MESH_UVSPHERE')
+    
+        
+
+
+# -----------------------------------------------------------
+# Depsgraph Handler
+# -----------------------------------------------------------
+_depsgraph_handler_active_splines = True # Global flag to prevent re-entrancy
+
+def perspective_depsgraph_handler_splines(scene, depsgraph):
+    global _depsgraph_handler_active_splines
+    if not _depsgraph_handler_active_splines or not bpy.context.screen: # Ensure screen context exists
+        return
+    if not hasattr(scene, 'perspective_tool_settings_splines') or scene.perspective_tool_settings_splines is None:
+        return
+
+    # Attempt to get a valid context for updates if the default one isn't right
+    context_for_update = bpy.context
+    if context_for_update.scene != scene: # If handler triggered from a different scene context
+        valid_context_found = False
+        for window in bpy.context.window_manager.windows:
+            if window.screen:
+                for area in window.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        for region in area.regions:
+                            if region.type == 'WINDOW':
+                                try:
+                                    context_for_update = bpy.context.temp_override(window=window, area=area, region=region, screen=window.screen)
+                                    if context_for_update.scene == scene: # Check if this override matches the depsgraph scene
+                                        valid_context_found = True
+                                        break
+                                except Exception as e:
+                                    # print(f"Depsgraph: Error creating temp_override: {e}")
+                                    pass # Could not override, try next
+                        if valid_context_found: break
+            if valid_context_found: break
+        if not valid_context_found:
+            # print("Depsgraph: Could not find suitable VIEW_3D context for scene updates.")
+            return # Cannot proceed without a valid context for the current scene
+
+    tool_settings = scene.perspective_tool_settings_splines
+    needs_horizon_recalc = False
+    vp_moved_for_active_type = False
+
+    # Disable handler during its execution to prevent loops
+    _depsgraph_handler_active_splines = False
+    try:
+        for update in depsgraph.updates:
+            if not hasattr(update.id, "name") or not update.is_updated_transform:
+                continue
+            
+            obj_name = ""
+            try: # ID might be a non-object type sometimes, so check its type
+                if isinstance(update.id, bpy.types.Object):
+                    obj_name = update.id.name
+                else: # If it's not an object, skip (e.g. material update)
+                    continue
+            except AttributeError: # update.id might not always have .name if it's already unlinked
+                continue
+
+            # Horizon Control Object Moved
+            if obj_name == HORIZON_CTRL_OBJ_NAME:
+                horizon_ctrl_obj = scene.objects.get(HORIZON_CTRL_OBJ_NAME) # Use scene.objects
+                if horizon_ctrl_obj:
+                    new_z = horizon_ctrl_obj.location.z
+                    if abs(tool_settings.horizon_y_level - new_z) > 0.001:
+                        tool_settings.horizon_y_level = new_z # This will trigger its own update func
+                    needs_horizon_recalc = True 
+                    # For 2P/3P, if HC moves, VPs on horizon should follow via their generation logic.
+                    # This depsgraph handler primarily updates the visual horizon line itself.
+                    # And syncs tool_settings.horizon_y_level.
+                    # The actual VP Z for 1P is now independent.
+
+            # A Vanishing Point Empty Moved
+            elif obj_name.startswith(VP_PREFIX):
+                vp_obj_moved = scene.objects.get(obj_name)
+                if vp_obj_moved:
+                    current_type = tool_settings.current_perspective_type
+                    # 1P: If the 1P VP moves, its Z defines the horizon.
+                    if current_type == 'ONE_POINT' and vp_obj_moved.name.startswith(VP_TYPE_SPECIFIC_PREFIX_MAP['ONE_POINT']):
+                        if abs(tool_settings.horizon_y_level - vp_obj_moved.location.z) > 0.001 :
+                             tool_settings.horizon_y_level = vp_obj_moved.location.z # Update setting from VP
+                        needs_horizon_recalc = True
+                        vp_moved_for_active_type = True
+                    # 2P: H VPs determine horizon.
+                    elif current_type == 'TWO_POINT' and vp_obj_moved.name.startswith(VP_TYPE_SPECIFIC_PREFIX_MAP['TWO_POINT']):
+                        # The horizon Z is derived from the VPs; if one moves, its Z should align with the other
+                        # or the horizon control. The `create_default_two_point` and horizon update should handle this.
+                        # Here, we just flag for recalc.
+                        needs_horizon_recalc = True
+                        vp_moved_for_active_type = True
+                    # 3P: H VPs determine horizon.
+                    elif current_type == 'THREE_POINT':
+                        if vp_obj_moved.name.startswith(VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_H']):
+                            needs_horizon_recalc = True
+                            vp_moved_for_active_type = True
+                        # V_VP move doesn't directly change horizon line, but might affect guides if auto-updating guides here.
+                        # For now, only H_VPs trigger horizon recalc.
+                    
+                    # If any VP moves, and auto-guide regeneration is desired, it would be triggered here.
+                    # For now, we only update the horizon line visual. Guide regeneration is manual.
+
+        if needs_horizon_recalc: # Also implies vp_moved_for_active_type if it was a relevant VP
+            # Use the context_for_update we tried to establish
+            update_dynamic_horizon_line_curve(context_for_update)
+
+    except Exception as e:
+        print(f"Error in perspective_depsgraph_handler_splines: {e}")
+    finally:
+        _depsgraph_handler_active_splines = True # Re-enable handler
+
+# -----------------------------------------------------------
+# Registration
+# -----------------------------------------------------------
+# Original relevant part:
+#    PERSPECTIVE_OT_merge_guides,
+#    PERSPECTIVE_OT_merge_and_convert_to_gpencil,
+#    # Optionally, remove this if you don't want the old merge/convert functionality:
+#    # PERSPECTIVE_OT_convert_to_grease_pencil,  <-- This was the old one
+#    Rogue_Perspective_AI_PT_main,
+
+# Change to include the new operator name:
+# (This tuple is usually found near the end of your script, just before the register() and unregister() functions)
+
+# (Near the end of your script)
+classes_splines = (
+    PerspectiveToolSettingsSplines,
+
+    # --- Generation and Setup Operators ---
+    PERSPECTIVE_OT_generate_horizon_spline,
+    PERSPECTIVE_OT_add_vanishing_point_empty,
+    PERSPECTIVE_OT_generate_one_point_splines,
+    # Removed: PERSPECTIVE_OT_generate_two_point_splines, (the old combined one)
+    PERSPECTIVE_OT_create_2p_vps_if_needed,         # New helper for 2P
+    PERSPECTIVE_OT_generate_2p_vp1_lines,           # New for 2P
+    PERSPECTIVE_OT_generate_2p_vp2_lines,           # New for 2P
+    PERSPECTIVE_OT_generate_2p_vertical_lines,      # New for 2P
+    PERSPECTIVE_OT_create_3p_vps_if_needed,
+    PERSPECTIVE_OT_generate_3p_h1_lines,
+    PERSPECTIVE_OT_generate_3p_h2_lines,
+    PERSPECTIVE_OT_generate_3p_v_lines,
+    PERSPECTIVE_OT_generate_fish_eye_splines,
+    PERSPECTIVE_OT_align_camera_splines,
+    PERSPECTIVE_OT_create_box_grid,
+    PERSPECTIVE_OT_trim_guides_to_camera,
+    PERSPECTIVE_OT_clear_grid_planes, # Make sure this is added if you chose Option B for clearing grids
+
+    # --- Clearing Operators ---
+    PERSPECTIVE_OT_remove_selected_helper_empty,
+    PERSPECTIVE_OT_clear_type_guides_splines,
+    PERSPECTIVE_OT_clear_just_guides,
+    PERSPECTIVE_OT_clear_horizon_spline,
+    PERSPECTIVE_OT_clear_all_perspective_splines,
+
+    # --- Merging Operators ---
+    PERSPECTIVE_OT_merge_specific_guides,
+    PERSPECTIVE_OT_merge_guides, 
+
+    # --- Visibility Operator ---
+    PERSPECTIVE_OT_toggle_guide_visibility,
+
+    # --- UI Panels ---
+    Rogue_Perspective_AI_PT_main,
+    VIEW3D_PT_rogue_perspective_grids,
+    VIEW3D_PT_rogue_perspective_trimmer,
+)
+
+def register():
+    global _depsgraph_handler_active_splines, previous_perspective_type_on_switch
+    for cls in classes_splines:
+        try:
+            bpy.utils.register_class(cls)
+        except ValueError as e:
+            print(f"Warning: Class {cls.__name__} already registered or error: {e}")
+
+    try:
+        bpy.types.Scene.perspective_tool_settings_splines = PointerProperty(type=PerspectiveToolSettingsSplines)
+    except TypeError as e: # Already registered from a previous script run without full unregister
+        print(f"Warning: perspective_tool_settings_splines already exists on Scene type: {e}")
+
+    if perspective_depsgraph_handler_splines not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(perspective_depsgraph_handler_splines)
+    
+    _depsgraph_handler_active_splines = True
+    
+    # The global 'previous_perspective_type_on_switch' is already initialized to 'NONE'
+    # at the module level. We don't need to, and shouldn't, try to access bpy.context.scene here
+    # to potentially change it during registration.
+    # The EnumProperty's default and its update callback will handle the initial state correctly.
+
+    print("Rogue Perspective AI Registered.")
+
+
+def unregister():
+    global _depsgraph_handler_active_splines
+    _depsgraph_handler_active_splines = False # Disable handler first
+    
+    if perspective_depsgraph_handler_splines in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(perspective_depsgraph_handler_splines)
+    
+    # Try to delete the PointerProperty from bpy.types.Scene
+    if hasattr(bpy.types.Scene, 'perspective_tool_settings_splines'):
+        try:
+            del bpy.types.Scene.perspective_tool_settings_splines
+        except Exception as e:
+            print(f"Warning: Could not delete perspective_tool_settings_splines from Scene: {e}")
+
+    for cls in reversed(classes_splines):
+        if hasattr(bpy.utils, "unregister_class"): # Check if unregister_class is available
+            try:
+                bpy.utils.unregister_class(cls)
+            except RuntimeError as e: # Catch common errors like "not registered"
+                print(f"Warning: Could not unregister class {cls.__name__}: {e}")
+            except Exception as e: # Catch any other unexpected errors
+                print(f"Error unregistering class {cls.__name__}: {e}")
+                
+    print("Rogue Perspective AI Unregistered.")
+
+if __name__ == "__main__":
+    # This block is for testing within Blender's text editor.
+    # It attempts to unregister first, then register.
+    
+    # Check if any class from the addon is registered as a proxy for the addon being loaded
+    # A more robust check would be if bl_info["name"] is in bpy.context.preferences.addons
+    # For simple script reload, checking a key class is often sufficient.
+    is_registered_check_key_class = "Rogue_Perspective_AI_PT_main"
+    
+    # Attempt to unregister if it seems like the addon is already loaded
+    # Look for the class in bpy.types (where registered classes reside)
+    if hasattr(bpy.types, is_registered_check_key_class):
+        print(f"'{is_registered_check_key_class}' found in bpy.types. Attempting unregister first...")
+        try:
+            unregister()
+        except Exception as e:
+            print(f"Error during pre-emptive unregistration in __main__: {e}")
+            # It's possible unregister() itself might fail if state is inconsistent
+            # from a previous bad load/unload. Forcing it might be risky.
+            # For development, sometimes a Blender restart is cleaner if this gets messy.
+    
+    # Now, register the addon
+    try:
+        register()
+    except Exception as e:
+        print(f"Error during registration in __main__: {e}")
