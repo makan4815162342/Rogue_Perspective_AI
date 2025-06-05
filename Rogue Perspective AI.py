@@ -582,6 +582,264 @@ def add_vp_empty_if_missing(context, target_vp_name, default_location, empty_col
 
 # MAKE SURE 'get_guides_collection' and HORIZON_CURVE_OBJ_NAME are defined before this point.
 
+
+class PERSPECTIVE_OT_extract_perspective_from_image(bpy.types.Operator):
+    """Extract one-point perspective from a Grease Pencil drawing on a reference image.
+    Requires at least two strokes drawn on the active GPencil object's active frame.
+    The intersection of the first two strokes is used to compute the vanishing point.
+    Tip: Ensure you have at least two strokes and that a Grease Pencil object is active or selected."""
+    bl_idname = "perspective_splines.extract_perspective_from_image"
+    bl_label = "Extract Perspective from Image (GPencil)"
+    bl_description = ("Select a Grease Pencil object that has at least two strokes on its active frame, "
+                      "or ensure it is the active object. "
+                      "The intersection of the first two strokes defines the one-point vanishing point.")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        if ts.current_perspective_type != 'ONE_POINT':
+            self.report({'ERROR'}, "This extraction currently only supports ONE POINT mode. Please switch to One Point mode.")
+            return {'CANCELLED'}
+
+        gp_obj = None
+        # 1. Check active object
+        if context.active_object and context.active_object.type == 'GPENCIL':
+            gp_obj = context.active_object
+            self.report({'INFO'}, f"Using active Grease Pencil object: {gp_obj.name}")
+        else:
+            # 2. Check selected objects if active object is not a GPencil
+            selected_gp_objects = [obj for obj in context.selected_objects if obj.type == 'GPENCIL']
+            if len(selected_gp_objects) == 1:
+                gp_obj = selected_gp_objects[0]
+                # Optionally make it active for consistency, though not strictly necessary for a read-only operation here
+                # context.view_layer.objects.active = gp_obj
+                self.report({'INFO'}, f"Using selected Grease Pencil object: {gp_obj.name}")
+            elif len(selected_gp_objects) > 1:
+                self.report({'ERROR'}, "Multiple Grease Pencil objects selected. Please select only one.")
+                return {'CANCELLED'}
+            else:
+                # 3. Fallback: Scan scene for any GPencil object if no active or single selected GP found
+                self.report({'WARNING'}, "No active or uniquely selected Grease Pencil object. Searching the scene for one...")
+                gp_obj = next((obj for obj in context.scene.objects if obj.type == 'GPENCIL'), None)
+                if gp_obj:
+                    self.report({'INFO'}, f"Found Grease Pencil object in scene: {gp_obj.name}. Consider selecting it or making it active directly for clarity.")
+
+        if not gp_obj:
+            self.report({'ERROR'}, "No Grease Pencil object found. Please add a Grease Pencil object, draw strokes, and ensure it's active or selected.")
+            return {'CANCELLED'}
+
+        gp_data = gp_obj.data
+        if not gp_data.layers or not any(gp_data.layers): # Ensure there's at least one layer
+            self.report({'ERROR'}, f"No Grease Pencil layers found in '{gp_obj.name}'.")
+            return {'CANCELLED'}
+
+        layer = gp_data.layers.active
+        if not layer: # If no active layer, try the first one
+            layer = gp_data.layers[0]
+        if not layer: # Should be caught by the check above, but defensive
+             self.report({'ERROR'}, f"Could not determine an active or valid layer in '{gp_obj.name}'.")
+             return {'CANCELLED'}
+
+        if not layer.frames or not any(layer.frames): # Ensure there's at least one frame
+            self.report({'ERROR'}, f"No Grease Pencil frames available in the active/selected layer of '{gp_obj.name}'.")
+            return {'CANCELLED'}
+
+        frame = layer.active_frame # Use active_frame directly
+        if not frame: # Fallback if no active_frame (e.g. new layer)
+            if layer.frames:
+                frame = layer.frames[0] # Try the first frame
+            else: # Should be caught by the check above
+                self.report({'ERROR'}, f"No frames found in layer '{layer.info}' of '{gp_obj.name}'.")
+                return {'CANCELLED'}
+        
+        strokes = frame.strokes
+        if len(strokes) < 2:
+            self.report({'ERROR'}, f"At least two strokes are required in the current frame of '{gp_obj.name}' for one-point perspective. Found {len(strokes)} strokes.")
+            return {'CANCELLED'}
+
+        def get_stroke_line(stroke):
+            if len(stroke.points) < 2:
+                self.report({'WARNING'}, "A stroke has less than 2 points and will be ignored.")
+                return None
+            # Assuming GP strokes are drawn in a 2D plane (e.g., view aligned) for this purpose
+            # The Z component of stroke.points[X].co is often 0 or irrelevant if drawn on a 2D canvas/view
+            p0 = Vector((stroke.points[0].co.x, stroke.points[0].co.y))
+            p1 = Vector((stroke.points[-1].co.x, stroke.points[-1].co.y)) # Use the last point of the stroke
+            if (p1 - p0).length < 1e-5: # Check if points are virtually identical
+                self.report({'WARNING'}, "A stroke's start and end points are too close; it cannot form a line.")
+                return None
+            return p0, p1
+
+        line1_pts = get_stroke_line(strokes[0])
+        line2_pts = get_stroke_line(strokes[1])
+
+        if not line1_pts or not line2_pts:
+            self.report({'ERROR'}, "Could not define two valid lines from the first two strokes. Ensure strokes are long enough.")
+            return {'CANCELLED'}
+
+        def line_intersection(p0, p1, q0, q1): # p0,p1 from line1; q0,q1 from line2
+            s = p1 - p0
+            r = q1 - q0
+            denom = s.x * r.y - s.y * r.x # Cross product in 2D (s.x*r.y - s.y*r.x)
+            if abs(denom) < 1e-9: # Increased precision for parallelism check
+                # Check if they are collinear and overlapping (more complex, for now assume parallel means no single VP)
+                # A simple check for collinearity if parallel: (q0-p0) cross s == 0
+                # if abs((q0.x - p0.x) * s.y - (q0.y - p0.y) * s.x) < 1e-9:
+                #     self.report({'WARNING'}, "Strokes are collinear.") # Could average endpoints or pick one
+                return None  # Lines are parallel or collinear and not intersecting at a single point for VP
+            
+            t_numerator = (q0.x - p0.x) * r.y - (q0.y - p0.y) * r.x
+            t = t_numerator / denom
+            
+            intersection_point = p0 + t * s
+            return intersection_point
+
+        ip = line_intersection(line1_pts[0], line1_pts[1], line2_pts[0], line2_pts[1])
+        if ip is None:
+            self.report({'ERROR'}, "The first two strokes do not intersect or are parallel/collinear. Cannot determine a vanishing point.")
+            return {'CANCELLED'}
+
+        # Use the scene's current horizon Z value for the 3D vanishing point.
+        horizon_z = ts.horizon_y_level
+        # The Grease Pencil coordinates are typically relative to the GP object's origin.
+        # To get world space, we'd transform ip by gp_obj.matrix_world if GP object is not at world origin AND 2D strokes are in object space.
+        # However, if strokes are drawn in 'View' or on a screen-aligned plane, ip is effectively in a view-aligned 2D space.
+        # For simplicity, assuming drawing occurred with Z=0 in object space, or view-aligned that maps to XY.
+        # The final VP is placed in world space.
+        
+        # If GP object is not at world origin (0,0,0) and not rotated/scaled,
+        # and strokes were drawn in its local XY plane:
+        vp_location_local_to_gp = Vector((ip.x, ip.y, 0)) # Assuming strokes drawn on GP's XY plane
+        vp_location_world = gp_obj.matrix_world @ vp_location_local_to_gp
+        vp_location_world.z = horizon_z # Override Z with horizon_z for the VP
+        
+        # If GP object is at world origin OR strokes are inherently in world XY:
+        # vp_location_world = Vector((ip.x, ip.y, horizon_z))
+
+
+        vp_name = VP_TYPE_SPECIFIC_PREFIX_MAP['ONE_POINT'] + "_1"
+        vp_obj_empty = bpy.data.objects.get(vp_name) # Renamed to avoid conflict with gp_obj
+        
+        if not vp_obj_empty:
+            # Pass the calculated world location
+            vp_obj_empty = add_vp_empty_if_missing(context, vp_name, vp_location_world, ts.one_point_vp_empty_color)
+        else:
+            vp_obj_empty.location = vp_location_world # Updates existing VP to new world location
+
+        # Ensure the tool setting for horizon_y_level matches the new VP's Z
+        if abs(ts.horizon_y_level - vp_location_world.z) > 0.001:
+            ts.horizon_y_level = vp_location_world.z # This will trigger its own update for the horizon line visual
+
+        update_dynamic_horizon_line_curve(context) # This will use the (potentially updated) ts.horizon_y_level
+                                                 # and the VP's new X,Y for 1P mode.
+        self.report({'INFO'}, f"Extracted 1P perspective: VP '{vp_name}' at {vp_location_world}")
+        return {'FINISHED'}
+
+
+
+
+class PERSPECTIVE_OT_clip_guides_to_camera(bpy.types.Operator):
+    """Clips each perspective guide so that its endpoints lie exactly on the camera borders."""
+    bl_idname = "perspective_splines.clip_guides_to_camera"
+    bl_label = "Clip Guides to Camera Borders"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def liang_barsky_clip(self, A, B):
+        """
+        Liang–Barsky clipping in 2D.
+        A and B are 2D tuples representing the projected endpoints (x,y) in normalized camera space.
+        Returns (t_min, t_max) such that:
+          clipped_point = A + t*(B-A) for t in [t_min, t_max].
+        If the line does not cross the unit square, returns None.
+        """
+        dx = B[0] - A[0]
+        dy = B[1] - A[1]
+        t_min = 0.0
+        t_max = 1.0
+
+        p = [-dx, dx, -dy, dy]
+        q = [A[0], 1 - A[0], A[1], 1 - A[1]]
+
+        for i in range(4):
+            if p[i] == 0:
+                if q[i] < 0:
+                    return None  # Parallel and outside
+            else:
+                r = q[i] / p[i]
+                if p[i] < 0:
+                    t_min = max(t_min, r)
+                else:
+                    t_max = min(t_max, r)
+                if t_min > t_max:
+                    return None  # No intersection
+        return t_min, t_max
+
+    def execute(self, context):
+        scene = context.scene
+        cam = scene.camera
+        if not cam:
+            self.report({'WARNING'}, "No active camera detected.")
+            return {'CANCELLED'}
+        
+        # Get guides collection (assumes you have a helper function get_guides_collection)
+        guides_coll = get_guides_collection(context)
+        if not guides_coll:
+            self.report({'WARNING'}, "No guides collection found.")
+            return {'CANCELLED'}
+
+        trimmed_obj_count = 0
+
+        # Loop over all guide objects in your guides collection (skip the horizon line)
+        for obj in guides_coll.objects:
+            if obj.type != 'CURVE' or obj.name == "VISUAL_Horizon_Line":
+                continue
+
+            curve = obj.data
+            change_flag = False
+            # Loop over every spline in the curve (assuming your guides are POLY curves with at least 2 points)
+            for spline in curve.splines:
+                if spline.type != 'POLY' or len(spline.points) < 2:
+                    continue
+
+                # Get the endpoints in world space
+                pt0_world = obj.matrix_world @ Vector(spline.points[0].co[:3])
+                pt1_world = obj.matrix_world @ Vector(spline.points[-1].co[:3])
+                
+                # Project endpoints to normalized camera space (NDC)
+                A_ndc = world_to_camera_view(scene, cam, pt0_world)
+                B_ndc = world_to_camera_view(scene, cam, pt1_world)
+                
+                # Only use the x and y components for 2D clipping
+                clip_result = self.liang_barsky_clip((A_ndc.x, A_ndc.y), (B_ndc.x, B_ndc.y))
+                if clip_result is None:
+                    # If the guide does not cross through the view, you may choose to hide it or set its endpoints to a dummy value.
+                    # Here we set both endpoints to the same 0-vector in local space to effectively collapse the guide.
+                    spline.points[0].co = (0, 0, 0, 1)
+                    spline.points[-1].co = (0, 0, 0, 1)
+                    change_flag = True
+                else:
+                    t_min, t_max = clip_result
+                    # Find the new world positions via linear interpolation
+                    new_pt0_world = pt0_world + (pt1_world - pt0_world) * t_min
+                    new_pt1_world = pt0_world + (pt1_world - pt0_world) * t_max
+
+                    # Convert these world positions back to the object's local space
+                    inv_world = obj.matrix_world.inverted()
+                    new_pt0_local = inv_world @ new_pt0_world
+                    new_pt1_local = inv_world @ new_pt1_world
+
+                    spline.points[0].co = (new_pt0_local.x, new_pt0_local.y, new_pt0_local.z, 1)
+                    spline.points[-1].co = (new_pt1_local.x, new_pt1_local.y, new_pt1_local.z, 1)
+                    change_flag = True
+
+            if change_flag:
+                curve.update_tag()
+                trimmed_obj_count += 1
+
+        self.report({'INFO'}, f"Clipped guides in {trimmed_obj_count} object(s).")
+        return {'FINISHED'}
+
+
 class PERSPECTIVE_OT_clear_grid_planes(Operator):
     bl_idname = "perspective_splines.clear_grid_planes"
     bl_label = "Clear Only Grid Planes"
@@ -2050,279 +2308,12 @@ class VIEW3D_PT_rogue_perspective_grids(Panel):
         toggle_op.group_prefix = "GridPlane_"
 
 
-class PERSPECTIVE_OT_trim_guides_to_camera(Operator):
-    bl_idname = "perspective_splines.trim_guides_to_camera"
-    bl_label = "Adjust Line Start/End to Camera"
-    bl_options = {'REGISTER', 'UNDO'}
 
-    search_steps: IntProperty(
-        name="Search Detail",
-        description="Number of steps to search along lines for camera borders.",
-        default=200, min=50, max=1000
-    )
-    scan_distance_from_vp: FloatProperty(
-        name="Scan Distance from VP (World Units)",
-        description="Max distance to scan along lines from VP (in both directions) for view intersection.",
-        default=1500.0, min=10.0, max=50000.0
-    )
 
-    @staticmethod
-    def get_camera_view_info(scene, cam):
-        if not scene or not cam or not cam.data:
-            return None
-        return {'min_x': 0.0, 'max_x': 1.0, 'min_y': 0.0, 'max_y': 1.0, 'char_length_for_norm': 1.0}
 
-    @staticmethod
-    def world_to_cam_normalized(scene, cam, world_coord):
-        try:
-            if not isinstance(world_coord, Vector):
-                world_coord_vec = Vector(world_coord)
-            else:
-                world_coord_vec = world_coord
-            return world_to_camera_view(scene, cam, world_coord_vec)
-        except Exception:
-            return Vector((-1, -1, -1))
 
-    @staticmethod
-    def is_point_in_cam_space(cam_coords, min_x=0.0, max_x=1.0, min_y=0.0, max_y=1.0, marginVal=0.0):
-        if cam_coords.z <= 0:
-            return False
-        return (min_x + marginVal <= cam_coords.x <= max_x - marginVal and
-                min_y + marginVal <= cam_coords.y <= max_y - marginVal)
-
-    def get_camera_and_context_override(self, context):
-        cam = None
-        area_for_op = None
-        view_region = None
-        active_window = context.window
-        if context.area and context.area.type == 'VIEW_3D':
-            rv3d = context.area.spaces.active.region_3d
-            if rv3d and rv3d.view_perspective == 'CAMERA':
-                cam_obj_from_rv3d = rv3d.camera_object if rv3d.camera_object else context.scene.camera
-                if cam_obj_from_rv3d:
-                    cam = cam_obj_from_rv3d
-                    area_for_op = context.area
-                    for r in area_for_op.regions:
-                        if r.type == 'WINDOW':
-                            view_region = r
-                            break
-                    if view_region:
-                        return cam, area_for_op, view_region
-        if not cam:
-            cam = context.scene.camera
-        if cam and not (area_for_op and view_region):
-            for area_iter in active_window.screen.areas:
-                if area_iter.type == 'VIEW_3D':
-                    area_for_op = area_iter
-                    for r_iter in area_iter.regions:
-                        if r_iter.type == 'WINDOW':
-                            view_region = r_iter
-                            break
-                    if view_region:
-                        break
-        if cam and area_for_op and view_region:
-            return cam, area_for_op, view_region
-        return None, None, None
-
-    def execute(self, context):
-        ts = context.scene.perspective_tool_settings_splines
-
-        cam, area_for_op, view_region = self.get_camera_and_context_override(context)
-        if not cam:
-            self.report({'WARNING'}, "No active camera.")
-            return {'CANCELLED'}
-        if not area_for_op or not view_region:
-            self.report({'WARNING'}, "No suitable 3D View.")
-            return {'CANCELLED'}
-
-        guides_coll = get_guides_collection(context)
-        if not guides_coll:
-            self.report({'INFO'}, "Guides collection not found.")
-            return {'CANCELLED'}
-
-        view_info = self.get_camera_view_info(context.scene, cam)
-        if not view_info:
-            self.report({'ERROR'}, "Could not get camera view info.")
-            return {'CANCELLED'}
-
-        lines_adjusted, objects_removed_count = 0, 0
-        override = {'scene': context.scene, 'region': view_region, 'area': area_for_op, 'space_data': area_for_op.spaces.active}
-        object_list_copy = list(guides_coll.objects)
-        objects_to_remove_indices = []
-
-        scan_dist = self.scan_distance_from_vp
-
-        for obj_idx, obj in enumerate(object_list_copy):
-            if not obj or obj.name not in bpy.data.objects:
-                continue
-            if obj.type != 'CURVE' or obj.name == HORIZON_CURVE_OBJ_NAME or not obj.data or not obj.data.splines:
-                continue
-            if obj.name.startswith("GridPlane_"):
-                continue
-
-            obj_matrix_world = obj.matrix_world
-            obj_matrix_world_inv = obj_matrix_world.inverted()
-            new_splines_data_for_object = []
-            made_change_to_this_object_splines = False
-
-            with context.temp_override(**override):
-                for spline in obj.data.splines:
-                    if not (spline.type == 'POLY' and len(spline.points) >= 2):
-                        if spline.type == 'BEZIER':
-                            new_splines_data_for_object.append({'type': 'BEZIER', 'points_data': [(bp.handle_left.copy(), bp.co.copy(), bp.handle_right.copy()) for bp in spline.bezier_points], 'cyclic': spline.use_cyclic_u})
-                        elif spline.type == 'POLY':
-                            new_splines_data_for_object.append({'type': 'POLY', 'points_data': [p.co.copy() for p in spline.points], 'cyclic': spline.use_cyclic_u})
-                        continue
-
-                    p0_local_orig_w1 = spline.points[0].co.copy()
-                    p1_local_orig_w1 = spline.points[-1].co.copy()
-                    vp_world = obj_matrix_world @ p0_local_orig_w1.xyz
-                    original_guide_end_world = obj_matrix_world @ p1_local_orig_w1.xyz
-                    direction_world = original_guide_end_world - vp_world
-
-                    if direction_world.length < 1e-5:
-                        vp_cam_norm = self.world_to_cam_normalized(context.scene, cam, vp_world)
-                        if self.is_point_in_cam_space(vp_cam_norm, marginVal=ts.trim_view_margin):
-                            new_splines_data_for_object.append({'type': 'POLY', 'points_data': [p0_local_orig_w1, p1_local_orig_w1], 'cyclic': False})
-                        continue
-
-                    direction_world_norm = direction_world.normalized()
-                    entry_on_margin_world = None
-                    exit_on_margin_world = None
-                    last_p_world = None
-                    last_in_margin = None
-
-                    # --- Improved scan/interpolation for border detection ---
-                    for i in range(self.search_steps + 1):
-                        current_t = -scan_dist + (i / self.search_steps) * (2 * scan_dist)
-                        current_p_world = vp_world + direction_world_norm * current_t
-                        current_p_cam = self.world_to_cam_normalized(context.scene, cam, current_p_world)
-                        is_currently_in_margin = self.is_point_in_cam_space(current_p_cam, marginVal=ts.trim_view_margin)
-
-                        if last_in_margin is not None and is_currently_in_margin != last_in_margin:
-                            # Interpolate to find the border crossing
-                            p0_world = last_p_world
-                            p1_world = current_p_world
-                            for interp in range(1, 11):
-                                alpha = interp / 10.0
-                                interp_world = p0_world.lerp(p1_world, alpha)
-                                interp_cam = self.world_to_cam_normalized(context.scene, cam, interp_world)
-                                interp_in_margin = self.is_point_in_cam_space(interp_cam, marginVal=ts.trim_view_margin)
-                                if interp_in_margin == is_currently_in_margin:
-                                    if is_currently_in_margin:
-                                        entry_on_margin_world = interp_world
-                                    else:
-                                        exit_on_margin_world = interp_world
-                                    break
-
-                        if is_currently_in_margin and entry_on_margin_world is None:
-                            entry_on_margin_world = current_p_world
-                        if is_currently_in_margin:
-                            exit_on_margin_world = current_p_world
-
-                        last_p_world = current_p_world
-                        last_in_margin = is_currently_in_margin
-
-                    final_p_start_world, final_p_end_world = None, None
-                    processed_by_margin_logic = False
-
-                    # --- Main: If line crosses the camera view, trim to entry/exit and extend further into view ---
-                    if entry_on_margin_world and exit_on_margin_world and (exit_on_margin_world - entry_on_margin_world).length > 1e-5:
-                        segment_vec = exit_on_margin_world - entry_on_margin_world
-                        segment_length = segment_vec.length
-                        start_p = entry_on_margin_world + segment_vec * ts.trim_start_percent
-                        end_p = entry_on_margin_world + segment_vec * ts.trim_end_percent
-                        final_p_start_world = start_p
-                        final_p_end_world = end_p
-                        processed_by_margin_logic = True
-
-                    # --- If not, check proximity to camera view and keep if close enough ---
-                    if not processed_by_margin_logic:
-                        min_dist = float('inf')
-                        closest_world = None
-                        for i in range(self.search_steps + 1):
-                            t = -scan_dist + (i / self.search_steps) * (2 * scan_dist)
-                            p_world = vp_world + direction_world_norm * t
-                            p_cam = self.world_to_cam_normalized(context.scene, cam, p_world)
-                            if p_cam.z > 0:
-                                dx = max(0, view_info['min_x'] - p_cam.x, p_cam.x - view_info['max_x'])
-                                dy = max(0, view_info['min_y'] - p_cam.y, p_cam.y - view_info['max_y'])
-                                dist = (dx ** 2 + dy ** 2) ** 0.5
-                                if dist < min_dist:
-                                    min_dist = dist
-                                    closest_world = p_world
-                        # Use the new keep-near-border property
-                        if min_dist <= ts.trim_keep_near_border_distance and closest_world is not None:
-                            min_len = max(ts.trim_min_visible_segment_length, 0.01)
-                            final_p_start_world = closest_world
-                            final_p_end_world = closest_world + direction_world_norm * min_len
-                            processed_by_margin_logic = True
-                        elif ts.trim_delete_lines_outside_strict_view and min_dist > ts.trim_deletion_distance_threshold:
-                            # Only delete if far away
-                            pass
-
-                    # Only keep lines that cross the camera view or are close enough
-                    if final_p_start_world and final_p_end_world:
-                        segment_vector = final_p_end_world - final_p_start_world
-                        if segment_vector.dot(direction_world_norm) > 1e-6:
-                            if segment_vector.length >= ts.trim_min_visible_segment_length:
-                                p_s_loc = (obj_matrix_world_inv @ final_p_start_world).to_4d()
-                                p_e_loc = (obj_matrix_world_inv @ final_p_end_world).to_4d()
-                                new_splines_data_for_object.append({'type': 'POLY', 'points_data': [p_s_loc, p_e_loc], 'cyclic': False})
-                                if (p_s_loc - p0_local_orig_w1).length > 1e-4 or (p_e_loc - p1_local_orig_w1).length > 1e-4:
-                                    made_change_to_this_object_splines = True
-
-            if not new_splines_data_for_object:
-                objects_to_remove_indices.append(obj_idx)
-            elif made_change_to_this_object_splines or len(new_splines_data_for_object) != len(obj.data.splines):
-                obj.data.splines.clear()
-                for s_data in new_splines_data_for_object:
-                    new_spline = obj.data.splines.new(type=s_data['type'])
-                    if s_data['type'] == 'POLY':
-                        if len(s_data['points_data']) >= 1:
-                            new_spline.points.add(len(s_data['points_data']) - 1)
-                            for i, pt_co4d in enumerate(s_data['points_data']):
-                                new_spline.points[i].co = pt_co4d
-                    elif s_data['type'] == 'BEZIER':
-                        if len(s_data['points_data']) > 0:
-                            new_spline.bezier_points.add(len(s_data['points_data']) - 1)
-                            for i, bp_data_tuple in enumerate(s_data['points_data']):
-                                bp = new_spline.bezier_points[i]
-                                bp.handle_left, bp.co, bp.handle_right = bp_data_tuple
-                                bp.handle_left_type = 'AUTO'
-                                bp.handle_right_type = 'AUTO'
-                    new_spline.use_cyclic_u = s_data['cyclic']
-                obj.data.update_tag()
-                lines_adjusted += 1
-
-        if objects_to_remove_indices:
-            for obj_idx_to_remove in sorted(objects_to_remove_indices, reverse=True):
-                obj_to_remove = object_list_copy[obj_idx_to_remove]
-                if obj_to_remove and obj_to_remove.name in bpy.data.objects:
-                    obj_data = obj_to_remove.data
-                    for coll in obj_to_remove.users_collection:
-                        coll.objects.unlink(obj_to_remove)
-                    bpy.data.objects.remove(obj_to_remove, do_unlink=False)
-                    if obj_data and obj_data.users == 0:
-                        try:
-                            if isinstance(obj_data, bpy.types.Curve):
-                                bpy.data.curves.remove(obj_data)
-                        except Exception as e:
-                            print(f"Error removing orphaned curve data: {e}")
-                    objects_removed_count += 1
-
-        report_parts = []
-        if lines_adjusted > 0:
-            report_parts.append(f"Adjusted {lines_adjusted} guide objects")
-        if objects_removed_count > 0:
-            report_parts.append(f"Removed {objects_removed_count} objects")
-        self.report({'INFO'}, ". ".join(report_parts) + "." if report_parts else "No guide lines required adjustment or removal based on current settings.")
-        return {'FINISHED'}
-
-    
-
-class VIEW3D_PT_rogue_perspective_trimmer(Panel):
-    bl_label = "Guide Trimmer / Adjust Length"
+class VIEW3D_PT_rogue_perspective_trimmer(bpy.types.Panel):
+    bl_label = "Guide Clipper"
     bl_idname = "VIEW3D_PT_rogue_perspective_trimmer"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -2334,55 +2325,38 @@ class VIEW3D_PT_rogue_perspective_trimmer(Panel):
         layout = self.layout
         ts = getattr(context.scene, "perspective_tool_settings_splines", None)
         if not ts:
-            layout.label(text="Trimmer settings not found.")
+            layout.label(text="Perspective settings not found.")
             return
 
         main_box = layout.box()
-        col_main = main_box.column()
+        col_main = main_box.column(align=True)
 
-        # --- Automatic Adjustment ---
-        col_main.label(text="Automatic Camera Trim:")
+        col_main.label(text="Clip Guides to Camera Borders:")
         col_main.operator(
-            PERSPECTIVE_OT_trim_guides_to_camera.bl_idname,
-            text="Auto-Trim Lines to Camera",
+            "perspective_splines.clip_guides_to_camera",
+            text="Clip Now",
             icon='MOD_LENGTH'
         )
-        col_main.separator()
 
-        # --- Trim Settings (for both auto and manual) ---
-        col_main.label(text="Trim Settings:")
-        param_box = col_main.box()
-        param_col = param_box.column(align=True)
-        param_col.prop(ts, "trim_view_margin", text="View Margin")
-        param_col.prop(ts, "trim_keep_near_border_distance", text="Keep Near Border")
-        param_col.prop(ts, "trim_min_visible_segment_length", text="Min Segment Length")
-        param_col.prop(ts, "trim_start_percent", text="Start % Inside")
-        param_col.prop(ts, "trim_end_percent", text="End % Inside")
-        col_main.separator()
 
-        # --- Culling options ---
-        culling_box = col_main.box()
-        culling_col = culling_box.column(align=True)
-        culling_col.prop(ts, "trim_delete_lines_outside_strict_view", text="Delete Only Far Lines")
-        if ts.trim_delete_lines_outside_strict_view:
-            culling_col.prop(ts, "trim_deletion_distance_threshold", text="Deletion Distance Threshold")
+    
+class VIEW3D_PT_perspective_extraction(bpy.types.Panel):
+    bl_label = "Perspective Extraction"
+    bl_idname = "VIEW3D_PT_perspective_extraction"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'RogueAI'
+    bl_description = "Use Grease Pencil strokes to extract perspective from a reference image."
 
-        col_main.separator()
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Draw at least two strokes on a GPencil object")
+        layout.label(text="and ensure it is selected in Object Mode.")
+        layout.operator("perspective_splines.extract_perspective_from_image", 
+                          text="Extract 1P Perspective", icon='IMAGE_RGB')
 
-        # --- Manual Fine-Tune Section ---
-        col_main.label(text="Manual Fine-Tune:")
-        col_main.operator(
-            PERSPECTIVE_OT_trim_guides_to_camera.bl_idname,
-            text="Apply Manual Adjustments",
-            icon='MOD_LENGTH'
-        )
-        col_main.separator()
 
-        # F9/Redo info
-        f9_box = col_main.box()
-        f9_col = f9_box.column(align=True)
-        f9_col.label(text="Fine-tune with F9 (Redo Last):")
-        f9_col.label(text="- Search Detail, Scan Radius")
+
 
 
 
@@ -2391,14 +2365,16 @@ class Rogue_Perspective_AI_PT_main(Panel):
     bl_idname = "VIEW3D_PT_rogue_perspective_ai"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'RogueAI' # This will be the tab name in the N-Panel
+    bl_category = 'RogueAI'
 
     @classmethod
     def poll(cls, context):
-        # Ensure the settings property group is available on the scene
-        return hasattr(context.scene, "perspective_tool_settings_splines") and \
-               context.scene.perspective_tool_settings_splines is not None
+        return hasattr(context.scene, "perspective_tool_settings_splines") and context.scene.perspective_tool_settings_splines
 
+    def draw(self, context):
+        layout = self.layout
+        ts = context.scene.perspective_tool_settings_splines
+    
     # --- Helper method for the Finalize Guides section ---
     def draw_finalize_guides_section(self, layout, context):
         tool_settings = context.scene.perspective_tool_settings_splines
@@ -2788,11 +2764,10 @@ classes_splines = (
     PERSPECTIVE_OT_generate_horizon_spline,
     PERSPECTIVE_OT_add_vanishing_point_empty,
     PERSPECTIVE_OT_generate_one_point_splines,
-    # Removed: PERSPECTIVE_OT_generate_two_point_splines, (the old combined one)
-    PERSPECTIVE_OT_create_2p_vps_if_needed,         # New helper for 2P
-    PERSPECTIVE_OT_generate_2p_vp1_lines,           # New for 2P
-    PERSPECTIVE_OT_generate_2p_vp2_lines,           # New for 2P
-    PERSPECTIVE_OT_generate_2p_vertical_lines,      # New for 2P
+    PERSPECTIVE_OT_create_2p_vps_if_needed,
+    PERSPECTIVE_OT_generate_2p_vp1_lines,
+    PERSPECTIVE_OT_generate_2p_vp2_lines,
+    PERSPECTIVE_OT_generate_2p_vertical_lines,
     PERSPECTIVE_OT_create_3p_vps_if_needed,
     PERSPECTIVE_OT_generate_3p_h1_lines,
     PERSPECTIVE_OT_generate_3p_h2_lines,
@@ -2800,28 +2775,36 @@ classes_splines = (
     PERSPECTIVE_OT_generate_fish_eye_splines,
     PERSPECTIVE_OT_align_camera_splines,
     PERSPECTIVE_OT_create_box_grid,
-    PERSPECTIVE_OT_trim_guides_to_camera,
-    PERSPECTIVE_OT_clear_grid_planes, # Make sure this is added if you chose Option B for clearing grids
+    PERSPECTIVE_OT_clip_guides_to_camera,
 
+    # --- New Extraction Operator ---
+    PERSPECTIVE_OT_extract_perspective_from_image,
+    
+    PERSPECTIVE_OT_clear_grid_planes,
+    
     # --- Clearing Operators ---
     PERSPECTIVE_OT_remove_selected_helper_empty,
     PERSPECTIVE_OT_clear_type_guides_splines,
     PERSPECTIVE_OT_clear_just_guides,
     PERSPECTIVE_OT_clear_horizon_spline,
     PERSPECTIVE_OT_clear_all_perspective_splines,
-
+    
     # --- Merging Operators ---
     PERSPECTIVE_OT_merge_specific_guides,
-    PERSPECTIVE_OT_merge_guides, 
-
+    PERSPECTIVE_OT_merge_guides,
+    
     # --- Visibility Operator ---
     PERSPECTIVE_OT_toggle_guide_visibility,
-
+    
     # --- UI Panels ---
     Rogue_Perspective_AI_PT_main,
     VIEW3D_PT_rogue_perspective_grids,
     VIEW3D_PT_rogue_perspective_trimmer,
+    VIEW3D_PT_perspective_extraction,  # <-- NEW extraction panel
 )
+
+
+
 
 def register():
     global _depsgraph_handler_active_splines, previous_perspective_type_on_switch
