@@ -164,8 +164,18 @@ def refresh_extraction_aid_lines(context, from_selection_change=False):
     selected_empties = [obj for obj in context.selected_objects if obj.type == 'EMPTY']
     
     if ts.current_perspective_type == 'ONE_POINT':
-        # ... your one-point extraction code ...
-        pass
+        helpers_1p = sorted([e for e in selected_empties if "1P_Aid" in e.name], key=lambda o: o.name)
+        if len(helpers_1p) == 4:
+            # Assume the first two helpers define one line and the next two the second line.
+            e1, e2, e3, e4 = helpers_1p
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_1P_A", 
+                                                e1.matrix_world.translation, e2.matrix_world.translation, aids_coll)
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_1P_B", 
+                                                e3.matrix_world.translation, e4.matrix_world.translation, aids_coll)
+            print("DEBUG refresh_aids: Drew/Updated 1P aid lines")
+        else:
+            print("DEBUG refresh_aids: Not exactly 4 '1P_Aid' empties selected for 1P aid lines.")
+
 
     elif ts.current_perspective_type == 'TWO_POINT':
         # ... your two-point extraction code ...
@@ -1877,7 +1887,7 @@ class PERSPECTIVE_OT_add_1p_extraction_empties(bpy.types.Operator):
     def execute(self, context):
         aids_coll = get_extraction_aids_collection(context)
         bpy.ops.object.select_all(action='DESELECT')
-        base_name = "1P_Helper"
+        base_name = "1P_Aid"
         # Define positions for front pair and back pair:
         front_pair = [Vector((-2, -2, 0)), Vector((-1, -1, 0))]
         back_pair = [Vector((2, -2, 0)), Vector((1, -1, 0))]
@@ -1891,10 +1901,10 @@ class PERSPECTIVE_OT_add_1p_extraction_empties(bpy.types.Operator):
             if new_empty:
                 new_empty.name = unique_name
                 new_empty.empty_display_size = 0.5
-                for coll in new_empty.users_collection:
-                    coll.objects.unlink(new_empty)
-                if new_empty.name not in aids_coll.objects:
-                    aids_coll.objects.link(new_empty)
+            for coll in new_empty.users_collection:
+                coll.objects.unlink(new_empty)
+            if new_empty.name not in aids_coll.objects:
+                aids_coll.objects.link(new_empty)
                 new_empty.select_set(True)
                 created_empties.append(new_empty)
             else:
@@ -3668,7 +3678,8 @@ class VIEW3D_PT_perspective_extraction(bpy.types.Panel):
             instr.label(text=" 2. Select them (or use 'Select 1P Helpers').")
             instr.label(text=" 3. Click 'Set 1P VP from Selection'.")
             col.separator()
-            col.operator("perspective_splines.extract_1p_from_selected_empties", text="Set 1P VP from Selection", icon='TRACKING_FORWARDS')
+            col.operator("perspective_splines.extract_1p_from_empties", text="Set 1P VP from Selection", icon='TRACKING_FORWARDS')
+
             sel = [o for o in context.selected_objects if o.type == 'EMPTY' and "1P_Aid" in o.name]
             if len(sel) == 4:
                 col.label(text="Status: 4 '1P_Aid' Empties selected. Ready.", icon='CHECKMARK')
