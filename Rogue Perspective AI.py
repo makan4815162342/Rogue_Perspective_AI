@@ -1086,6 +1086,60 @@ class PerspectiveToolSettingsSplines(PropertyGroup):
 
 # --- Operators for 3-Point Perspective - H_VP1 ---
 
+class PERSPECTIVE_OT_delete_all_helpers(bpy.types.Operator):
+    """Deletes ALL helper empties from the aids collection."""
+    bl_idname = "perspective_splines.delete_all_helpers"
+    bl_label = "Delete All Helper Empties"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        # We can run this if the collection exists and has objects
+        aids_coll = bpy.data.collections.get(EXTRACTION_AIDS_COLLECTION)
+        return aids_coll and len(aids_coll.objects) > 0
+
+    def execute(self, context):
+        aids_coll = get_extraction_aids_collection(context)
+        
+        # Create a list of helper empties to delete to avoid issues while iterating
+        helpers_to_delete = [
+            obj for obj in aids_coll.objects 
+            if obj.type == 'EMPTY' and "_Aid" in obj.name
+        ]
+
+        if not helpers_to_delete:
+            self.report({'INFO'}, "No helper empties found to delete.")
+            return {'CANCELLED'}
+
+        deleted_count = len(helpers_to_delete)
+        
+        # Deselect everything to avoid context issues
+        if context.active_object:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+
+        # Remove the objects
+        for obj in helpers_to_delete:
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except ReferenceError:
+                # Object might have already been removed by another process
+                pass
+            except Exception as e:
+                print(f"Could not remove helper empty {obj.name}: {e}")
+
+        # Also clear any visual lines that might be left over
+        clear_extraction_aids_lines(context)
+
+        self.report({'INFO'}, f"Deleted {deleted_count} helper empties.")
+        
+        # Refresh the UI
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+        return {'FINISHED'}
+
 class PERSPECTIVE_OT_extract_3p_v_from_empties(bpy.types.Operator):
     """Extracts and sets the main vertical VP from 4 selected helper empties."""
     bl_idname = "perspective_splines.extract_3p_v_from_empties"
