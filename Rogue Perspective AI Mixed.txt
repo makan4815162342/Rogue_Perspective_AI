@@ -48,12 +48,125 @@ EXTRACTION_AIDS_COLLECTION = "Perspective_Extraction_Aids_Collection"
 # Utility Functions
 # -----------------------------------------------------------
 
-# -----------------------------------------------------------
-# Helper: Add Vanishing Point Empty if Missing
-# -----------------------------------------------------------
-# -----------------------------------------------------------
-# Helper: Add Vanishing Point Empty if Missing
-# -----------------------------------------------------------
+
+# Place in the "Utility Functions" section, near the other clip functions
+
+
+def clip_poly_spline_to_polygon(spline, obj_matrix, inv_obj_matrix, polygon, scene, cam):
+    """
+    Clips every consecutive segment of a POLY spline to a given convex polygon in NDC space.
+    
+    Args:
+        spline: The POLY spline (bpy.types.Spline) to process.
+        obj_matrix: The world matrix of the guide curve object.
+        inv_obj_matrix: The inverse of that world matrix.
+        polygon: A list of 2D Vectors representing the clipping polygon (assumed CCW-ordered).
+        scene: The current scene.
+        cam: The active camera.
+        
+    Returns:
+        A list of clipped segments. Each segment is a list of two Vectors (in the curve’s local space)
+        representing the endpoints of the visible part of that segment.
+    """
+    new_segments = []
+    # Get the original points in local space
+    points = [Vector(pt.co[:3]) for pt in spline.points]
+
+    for i in range(len(points) - 1):
+        # Convert local points to world space.
+        p0_world = obj_matrix @ points[i]
+        p1_world = obj_matrix @ points[i+1]
+        # Convert world positions to camera NDC (only X and Y)
+        p0_cam = world_to_camera_view(scene, cam, p0_world)
+        p1_cam = world_to_camera_view(scene, cam, p1_world)
+        p0_ndc = Vector((p0_cam.x, p0_cam.y))
+        p1_ndc = Vector((p1_cam.x, p1_cam.y))
+        
+        # Use your existing helper to clip this segment against the polygon.
+        clipped = clip_segment_to_convex_polygon(p0_ndc, p1_ndc, polygon)
+        if clipped is None:
+            continue  # This segment is completely outside.
+        # Determine interpolation parameters
+        seg = p1_ndc - p0_ndc
+        seg_len_sq = seg.length_squared
+        def project_t(pt):
+            # Project the clipped point onto the segment
+            v = pt - p0_ndc
+            t_raw = v.dot(seg) / seg_len_sq if seg_len_sq > 1e-9 else 0.0
+            return min(max(t_raw, 0.0), 1.0)
+        t0 = project_t(clipped[0])
+        t1 = project_t(clipped[1])
+        # Interpolate in world space for precise points.
+        new_p0_world = p0_world.lerp(p1_world, t0)
+        new_p1_world = p0_world.lerp(p1_world, t1)
+        # Convert back to local coordinates
+        local_p0 = inv_obj_matrix @ new_p0_world
+        local_p1 = inv_obj_matrix @ new_p1_world
+        new_segments.append([local_p0, local_p1])
+        
+    return new_segments
+
+
+
+
+def sort_polygon_ccw(points):
+    """Given a list of 2D Vector points, it returns them sorted counter-clockwise."""
+    if not points:
+        return []
+    
+    # --- THE FIX IS HERE ---
+    # We explicitly create a 2D vector and sum the points manually.
+    # This is more robust than using sum(points, Vector()).
+    center = Vector((0.0, 0.0)) 
+    for p in points:
+        center += p
+    center /= len(points)
+    
+    # The rest of the function remains the same.
+    return sorted(points, key=lambda p: math.atan2(p.y - center.y, p.x - center.x))
+
+#
+# ---------- END OF THE SECTION TO FIX ----------
+#
+
+
+def clip_segment_to_convex_polygon(p1, p2, polygon):
+    """
+    Clips a 2D segment (p1, p2) to a convex polygon.
+    Returns (new_p1, new_p2) if the segment crosses or is inside the polygon, or None if fully outside.
+    """
+    tE, tL = 0.0, 1.0
+    d = p2 - p1
+    n_edges = len(polygon)
+    for i in range(n_edges):
+        a = polygon[i]
+        b = polygon[(i + 1) % n_edges]
+        edge = b - a
+        # Inward normal (for CCW polygons)
+        normal = Vector((edge.y, -edge.x))
+        w = p1 - a
+        denom = normal.dot(d)
+        num = -normal.dot(w)
+        if abs(denom) < 1e-9:
+            if num < 0:
+                return None  # Outside and parallel
+            else:
+                continue  # Parallel and inside
+        t = num / denom
+        if denom < 0:
+            if t > tL:
+                return None
+            if t > tE:
+                tE = t
+        else:
+            if t < tE:
+                return None
+            if t < tL:
+                tL = t
+    if tE > tL:
+        return None
+    return (p1 + d * tE, p1 + d * tL)
+
 
 def draw_finalize_guides_section(layout, context):
     ts = context.scene.perspective_tool_settings_splines
@@ -864,33 +977,72 @@ def switch_perspective_type_prop(self, context): # self is PerspectiveToolSettin
 # Custom Properties
 # -----------------------------------------------------------
 
-# -----------------------------------------------------------
-# Custom Properties
-# -----------------------------------------------------------
+#
+# ------------------ START: Fully Updated PerspectiveToolSettingsSplines Class ------------------
+#
 
-# -----------------------------------------------------------
-# Custom Properties
-# -----------------------------------------------------------
+#
+# ------------------ START: Fully Updated PerspectiveToolSettingsSplines Class ------------------
+#
+
+#
+# ------------------ START: Fully Updated PerspectiveToolSettingsSplines Class ------------------
+#
 
 class PerspectiveToolSettingsSplines(PropertyGroup):
+
+    # --- Fish Eye Specific Properties ---
+    fish_eye_draw_1p: BoolProperty(
+        name="Draw 1P at Center",
+        description="Draw 1-point perspective lines at the center of the Fish Eye grid",
+        default=True
+    )
+    one_point_orientation_x: FloatProperty(
+        name="1P Grid Rot X",
+        description="Orientation of the 1P grid around the X-axis (degrees)",
+        default=90.0,
+        min=-360.0,
+        max=360.0
+    )
+    one_point_orientation_y: FloatProperty(
+        name="1P Grid Rot Y",
+        description="Orientation of the 1P grid around the Y-axis (degrees)",
+        default=90.0,
+        min=-360.0,
+        max=360.0
+    )
+    one_point_orientation_z: FloatProperty(
+        name="1P Grid Rot Z",
+        description="Orientation of the 1P grid around the Z-axis (degrees)",
+        default=0.0,
+        min=-360.0,
+        max=360.0
+    )
+    fish_eye_front_only: BoolProperty(
+        name="Front Only",
+        description="Show only the front hemisphere of the Fish Eye grid",
+        default=True
+    )
+
+    # --- Horizon Line Properties ---
     horizon_y_level: FloatProperty(
         name="1P Horizon Z",
         default=0.0,
-        update=update_horizon_control_from_prop, # Assumes this callback exists
+        update=lambda self, context: update_horizon_control_from_prop(self, context),
         description="Z-level for the 1P horizon line control object"
     )
     horizon_line_length: FloatProperty(
         name="1P Horizon Length",
         default=200.0,
         min=1.0,
-        update=update_horizon_visuals_from_props # Assumes this callback exists
+        update=lambda self, context: update_horizon_visuals_from_props(self, context)
     )
     horizon_line_thickness: FloatProperty(
         name="Horizon Thickness",
         default=0.02,
         min=0.001,
         max=0.5,
-        update=update_horizon_visuals_from_props
+        update=lambda self, context: update_horizon_visuals_from_props(self, context)
     )
     horizon_line_color: FloatVectorProperty(
         name="Horizon Color",
@@ -899,15 +1051,16 @@ class PerspectiveToolSettingsSplines(PropertyGroup):
         default=(0.9, 0.9, 0.2, 1.0),
         min=0.0,
         max=1.0,
-        update=update_horizon_visuals_from_props
+        update=lambda self, context: update_horizon_visuals_from_props(self, context)
     )
 
+    # --- General Guide Appearance ---
     guide_curves_thickness: FloatProperty(
         name="Guide Lines Thickness",
         default=0.01,
         min=0.001,
         max=0.5,
-        update=update_guides_visuals_from_props # Assumes this callback exists
+        update=lambda self, context: update_guides_visuals_from_props(self, context)
     )
     guide_curves_opacity: FloatProperty(
         name="Guide Lines Opacity",
@@ -915,73 +1068,19 @@ class PerspectiveToolSettingsSplines(PropertyGroup):
         min=0.0,
         max=1.0,
         subtype='FACTOR',
-        update=update_guides_visuals_from_props
+        update=lambda self, context: update_guides_visuals_from_props(self, context)
     )
 
-    # VP Empty colors
-    one_point_vp_empty_color: FloatVectorProperty(
-        name="1P VP Empty Color", subtype='COLOR', size=4, default=(1.0, 0.7, 0.2, 1.0),
-        min=0.0, max=1.0, update=update_vp_empty_colors # Assumes this callback exists
-    )
-    two_point_vp1_empty_color: FloatVectorProperty(
-        name="2P VP1 Empty Color", subtype='COLOR', size=4, default=(1.0, 0.4, 0.4, 1.0),
-        min=0.0, max=1.0, update=update_vp_empty_colors
-    )
-    two_point_vp2_empty_color: FloatVectorProperty(
-        name="2P VP2 Empty Color", subtype='COLOR', size=4, default=(0.4, 1.0, 0.4, 1.0),
-        min=0.0, max=1.0, update=update_vp_empty_colors
-    )
-    three_point_vp_h1_empty_color: FloatVectorProperty(
-        name="3P VP H1 Empty Color", subtype='COLOR', size=4, default=(1.0, 0.2, 0.2, 1.0),
-        min=0.0, max=1.0, update=update_vp_empty_colors
-    )
-    three_point_vp_h2_empty_color: FloatVectorProperty(
-        name="3P VP H2 Empty Color", subtype='COLOR', size=4, default=(0.2, 1.0, 0.2, 1.0),
-        min=0.0, max=1.0, update=update_vp_empty_colors
-    )
-    three_point_vp_v_empty_color: FloatVectorProperty(
-        name="3P VP V Empty Color", subtype='COLOR', size=4, default=(0.2, 0.2, 1.0, 1.0),
-        min=0.0, max=1.0, update=update_vp_empty_colors
-    )
-    fish_eye_vp_empty_color: FloatVectorProperty(
-        name="FE VP Empty Color", subtype='COLOR', size=4, default=(0.5, 0.2, 0.8, 1.0),
-        min=0.0, max=1.0, update=update_vp_empty_colors
-    )
+    # --- VP Empty Colors ---
+    one_point_vp_empty_color: FloatVectorProperty(name="1P VP Empty Color", subtype='COLOR', size=4, default=(1.0, 0.7, 0.2, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    two_point_vp1_empty_color: FloatVectorProperty(name="2P VP1 Empty Color", subtype='COLOR', size=4, default=(1.0, 0.4, 0.4, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    two_point_vp2_empty_color: FloatVectorProperty(name="2P VP2 Empty Color", subtype='COLOR', size=4, default=(0.4, 1.0, 0.4, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    three_point_vp_h1_empty_color: FloatVectorProperty(name="3P VP H1 Empty Color", subtype='COLOR', size=4, default=(1.0, 0.2, 0.2, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    three_point_vp_h2_empty_color: FloatVectorProperty(name="3P VP H2 Empty Color", subtype='COLOR', size=4, default=(0.2, 1.0, 0.2, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    three_point_vp_v_empty_color: FloatVectorProperty(name="3P VP V Empty Color", subtype='COLOR', size=4, default=(0.2, 0.2, 1.0, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
+    fish_eye_vp_empty_color: FloatVectorProperty(name="FE VP Empty Color", subtype='COLOR', size=4, default=(0.5, 0.2, 0.8, 1.0), min=0.0, max=1.0, update=update_vp_empty_colors)
 
-    # --- One Point ---
-    one_point_grid_density_radial: IntProperty(name="Radial Lines Density", default=16, min=2)
-    one_point_grid_density_ortho_x: IntProperty(name="Horiz. Parallels Density", default=7, min=0)
-    one_point_grid_density_ortho_y: IntProperty(name="Vert. Parallels Density", default=7, min=0)
-    one_point_draw_radial: BoolProperty(name="Draw Radial Lines", default=True)
-    one_point_draw_ortho_x: BoolProperty(name="Draw Horiz. Parallels", default=True)
-    one_point_draw_ortho_y: BoolProperty(name="Draw Vert. Parallels", default=True)
-    one_point_grid_extent: FloatProperty(name="Ortho Grid Extent Factor", default=1.0, min=0.1)
-    one_point_line_extension: FloatProperty(name="Radial Line Length", default=DEFAULT_LINE_EXTENSION, min=1.0)
-
-    # --- Two Point ---
-    two_point_grid_density_vp1: IntProperty(name="VP1 Lines Density", default=10, min=1)
-    two_point_grid_density_vp2: IntProperty(name="VP2 Lines Density", default=10, min=1)
-    two_point_grid_density_vertical: IntProperty(name="Vertical Lines Density", default=9, min=0)
-    two_point_verticals_x_spacing_factor: FloatProperty(name="Verticals X Spacing Factor", default=1.0, min=0.1, max=5.0)
-    two_point_grid_height: FloatProperty(name="Vertical Line Height", default=20.0, min=0.1)
-    two_point_grid_depth_offset: FloatProperty(name="Verticals' Y Plane Offset", default=0.0)
-    two_point_line_extension: FloatProperty(name="Radial Line Length", default=200.0, min=1.0)
-
-    # --- Three Point ---
-    three_point_line_extension: FloatProperty(name="Radial Line Length", default=200.0, min=1.0)
-    three_point_vp_h1_density: IntProperty(name="H1 Lines Density", default=8, min=1)
-    three_point_vp_h2_density: IntProperty(name="H2 Lines Density", default=8, min=1)
-    three_point_vp_v_density: IntProperty(name="V Lines Density", default=8, min=1)
-
-    # --- Fish Eye ---
-    fish_eye_strength: FloatProperty(name="Distortion Strength", default=0.5, min=-1.0, max=1.0)
-    fish_eye_grid_radial: IntProperty(name="Longitude Lines", default=16, min=3)
-    fish_eye_grid_concentric: IntProperty(name="Latitude Lines", default=8, min=1)
-    fish_eye_grid_radius: FloatProperty(name="Sphere Radius", default=15.0, min=0.1)
-    fish_eye_segments_per_curve: IntProperty(name="Curve Smoothness", default=24, min=4, max=64)
-    fish_eye_draw_latitude: BoolProperty(name="Draw Latitude Lines", default=True)
-    fish_eye_horizontal_scale: FloatProperty(name="Fish Eye Horizontal Scale", default=1.0, min=0.1, max=5.0)
-
+    # --- Mode Selector ---
     current_perspective_type: EnumProperty(
         name="Perspective Mode",
         items=[('NONE', "None", "No perspective guides active"),
@@ -990,22 +1089,42 @@ class PerspectiveToolSettingsSplines(PropertyGroup):
                ('THREE_POINT', "Three Point", "Three-point perspective"),
                ('FISH_EYE', "Fish Eye", "Fisheye (spherical) perspective cage")],
         default='NONE',
-        update=switch_perspective_type_prop # Assumes this callback exists
+        update=switch_perspective_type_prop
     )
-    camera_eye_height: FloatProperty(name="Camera Eye Height", default=1.6, min=0.1)
-    camera_distance: FloatProperty(name="Camera Distance from Target", default=15.0, min=1.0)
 
-    # --- Grid Creation Properties ---
-    grid_active_plane: EnumProperty(
-        name="Active Grid Plane",
-        items=[('FRONT', "Front (YZ)", "Create grid on the YZ plane"),
-               ('BACK', "Back (YZ)", "Create grid on the YZ plane (offset for back)"),
-               ('TOP', "Top (XY)", "Create grid on the XY plane"),
-               ('BOTTOM', "Bottom (XY)", "Create grid on the XY plane (offset for bottom)"),
-               ('LEFT', "Left (XZ)", "Create grid on the XZ plane (offset for left)"),
-               ('RIGHT', "Right (XZ)", "Create grid on the XZ plane")],
-        default='FRONT'
-    )
+    # --- Perspective Specific Generation Properties ---
+    # One Point
+    one_point_grid_density_radial: IntProperty(name="Radial Lines Density", default=16, min=2)
+    one_point_grid_density_ortho_x: IntProperty(name="Horiz. Parallels Density", default=7, min=0)
+    one_point_grid_density_ortho_y: IntProperty(name="Vert. Parallels Density", default=7, min=0)
+    one_point_draw_radial: BoolProperty(name="Draw Radial Lines", default=True)
+    one_point_draw_ortho_x: BoolProperty(name="Draw Horiz. Parallels", default=True)
+    one_point_draw_ortho_y: BoolProperty(name="Draw Vert. Parallels", default=True)
+    one_point_grid_extent: FloatProperty(name="Ortho Grid Extent Factor", default=1.0, min=0.1)
+    one_point_line_extension: FloatProperty(name="Radial Line Length", default=DEFAULT_LINE_EXTENSION, min=1.0)
+    # Two Point
+    two_point_grid_density_vp1: IntProperty(name="VP1 Lines Density", default=10, min=1)
+    two_point_grid_density_vp2: IntProperty(name="VP2 Lines Density", default=10, min=1)
+    two_point_grid_density_vertical: IntProperty(name="Vertical Lines Density", default=9, min=0)
+    two_point_verticals_x_spacing_factor: FloatProperty(name="Verticals X Spacing Factor", default=1.0, min=0.1, max=5.0)
+    two_point_grid_height: FloatProperty(name="Vertical Line Height", default=20.0, min=0.1)
+    two_point_grid_depth_offset: FloatProperty(name="Verticals' Y Plane Offset", default=0.0)
+    two_point_line_extension: FloatProperty(name="Radial Line Length", default=200.0, min=1.0)
+    # Three Point
+    three_point_line_extension: FloatProperty(name="Radial Line Length", default=200.0, min=1.0)
+    three_point_vp_h1_density: IntProperty(name="H1 Lines Density", default=8, min=1)
+    three_point_vp_h2_density: IntProperty(name="H2 Lines Density", default=8, min=1)
+    three_point_vp_v_density: IntProperty(name="V Lines Density", default=8, min=1)
+    # Fish Eye
+    fish_eye_strength: FloatProperty(name="Distortion Strength", default=0.5, min=-1.0, max=1.0)
+    fish_eye_grid_radial: IntProperty(name="Longitude Lines", default=16, min=3)
+    fish_eye_grid_concentric: IntProperty(name="Latitude Lines", default=8, min=1)
+    fish_eye_grid_radius: FloatProperty(name="Sphere Radius", default=15.0, min=0.1)
+    fish_eye_segments_per_curve: IntProperty(name="Curve Smoothness", default=24, min=4, max=64)
+    fish_eye_draw_latitude: BoolProperty(name="Draw Latitude Lines", default=True)
+    fish_eye_horizontal_scale: FloatProperty(name="Fish Eye Horizontal Scale", default=1.0, min=0.1, max=5.0)
+
+    # --- Construction Grid Properties ---
     grid_center: FloatVectorProperty(name="Grid Box Center", size=3, default=(0,0,0))
     grid_size: FloatVectorProperty(name="Grid Box Size (X,Y,Z)", size=3, default=(10,10,10), min=0.1)
     grid_subdivisions_u: IntProperty(name="Subdivisions U", default=10, min=1)
@@ -1017,56 +1136,49 @@ class PerspectiveToolSettingsSplines(PropertyGroup):
     grid_draw_left: BoolProperty(name="Draw Left Grid", default=False)
     grid_draw_right: BoolProperty(name="Draw Right Grid", default=False)
 
-    # --- Line Trimming Properties ---
-    trim_margin: FloatProperty(
-        name="Trim Margin (0-1)", default=0.05, min=0.0, max=0.5,
-        description="Margin outside camera view for trimming (0=exact edge)"
+    # --- Custom Shape Clipping Properties ---
+    custom_clipping_shape: PointerProperty(
+        name="Clipping Shape",
+        type=bpy.types.Object,
+        description="Select the Empty object to use as the custom clipping boundary",
+        poll=lambda self, obj: obj.type == 'EMPTY' and 'clipping_shape_type' in obj
     )
-    trim_view_margin: FloatProperty(
-        name="View Margin", default=0.05, min=0.0, max=0.49, subtype='FACTOR',
-        description="Margin from camera view edges (0.0 to 0.49). Lines inside this margin are always kept."
-    )
-    trim_keep_near_border_distance: FloatProperty(
-        name="Keep Near Border", default=0.1, min=0.0, max=0.5, subtype='FACTOR',
-        description="Normalized distance outside the camera border to keep and trim lines (0.0 = only inside, 0.1 = keep lines just outside border)."
-    )
-    trim_min_visible_segment_length: FloatProperty(
-        name="Min Segment Length", default=0.05, min=0.001, max=200.0,
-        description="Minimum world-space length for a trimmed line segment to be kept."
-    )
-    trim_delete_lines_outside_strict_view: BoolProperty(
-        name="Delete Only Far Lines", default=False,
-        description="If true, only lines far from the camera view are deleted. Lines near the border are kept."
-    )
-    trim_deletion_distance_threshold: FloatProperty(
-        name="Deletion Distance Threshold", default=0.2, min=0.0, max=2.0,
-        description="Normalized distance outside the camera view to delete lines (used only if 'Delete Only Far Lines' is true)."
-    )
-    trim_start_percent: FloatProperty(
-        name="Start % Inside", default=0.0, min=0.0, max=0.9, subtype='FACTOR',
-        description="Where to start the trimmed line as a percentage of the visible segment (0 = at border, 0.2 = 20% into view)"
-    )
-    trim_end_percent: FloatProperty(
-        name="End % Inside", default=1.0, min=0.1, max=1.0, subtype='FACTOR',
-        description="Where to end the trimmed line as a percentage of the visible segment (1 = at far border, 0.8 = 80% into view)"
+    clipping_shape_type_to_add: EnumProperty(
+        name="Shape Type",
+        items=[('RECTANGLE', "Rectangle", "A rectangular clipping area"),
+               ('CIRCLE', "Circle", "A circular clipping area")],
+        default='RECTANGLE',
+        description="The type of clipping shape to create"
     )
 
-    # --- Perspective Extraction Visual Aids ---
+    # --- Visual Aid Properties ---
     show_extraction_helper_lines: BoolProperty(
-        name="Show Aid Lines", # Shortened for UI
+        name="Show Aid Lines",
         description="Draw temporary lines between selected helper empties used for VP extraction.",
         default=False,
-        update=lambda self, context: refresh_extraction_aid_lines(context) # Assumes this callback exists
+        update=lambda self, context: refresh_extraction_aid_lines(context)
     )
-
-    # --- Main Vanishing Points Visibility ---
     show_main_vps: BoolProperty(
         name="Show Main VPs",
         description="Toggle visibility of the main perspective vanishing point empties (VP_1P_1, VP_2P_1, etc.)",
-        default=True, # VPs should be visible by default
-        update=lambda self, context: update_main_vps_visibility(context) # NEW callback needed
+        default=True,
+        update=lambda self, context: update_main_vps_visibility(context)
     )
-# End of PerspectiveToolSettingsSplines class
+
+    # --- Camera Alignment ---
+    camera_eye_height: FloatProperty(name="Camera Eye Height", default=1.6, min=0.1)
+    camera_distance: FloatProperty(name="Camera Distance from Target", default=15.0, min=1.0)
+
+#
+# ------------------  END: Fully Updated PerspectiveToolSettingsSplines Class  ------------------
+#
+#
+# ------------------  END: Fully Updated PerspectiveToolSettingsSplines Class  ------------------
+#
+    
+#
+# ------------------  END: Fully Updated PerspectiveToolSettingsSplines Class  ------------------
+#
 
 # -----------------------------------------------------------
 # Helper: Add Vanishing Point Empty if Missing
@@ -1080,11 +1192,278 @@ class PerspectiveToolSettingsSplines(PropertyGroup):
 # MAKE SURE 'get_guides_collection' and HORIZON_CURVE_OBJ_NAME are defined before this point.
 
 
-# Place this with your other Operator classes
+class PERSPECTIVE_OT_clip_guides_to_camera(bpy.types.Operator):
+    """Clips guide endpoints to the camera borders"""
+    bl_idname = "perspective_splines.clip_guides_to_camera"
+    bl_label = "Clip Guides to Camera"
+    bl_options = {'REGISTER', 'UNDO'}
 
-# Place with other Operator classes
+    def liang_barsky_clip(self, A, B):
+        """Liang–Barsky clipping in 2D for an axis-aligned rectangle (the camera view)."""
+        dx = B[0] - A[0]
+        dy = B[1] - A[1]
+        t_min, t_max = 0.0, 1.0
+        p = [-dx, dx, -dy, dy]
+        q = [A[0], 1 - A[0], A[1], 1 - A[1]]
+        for i in range(4):
+            if abs(p[i]) < 1e-9:
+                if q[i] < 0: return None
+            else:
+                r = q[i] / p[i]
+                if p[i] < 0: t_min = max(t_min, r)
+                else: t_max = min(t_max, r)
+            if t_min > t_max: return None
+        return t_min, t_max
 
-# --- Operators for 3-Point Perspective - H_VP1 ---
+    def execute(self, context):
+        scene = context.scene
+        cam = scene.camera
+        if not cam:
+            self.report({'WARNING'}, "No active camera detected.")
+            return {'CANCELLED'}
+        
+        guides_coll = get_guides_collection(context)
+        if not guides_coll:
+            self.report({'WARNING'}, "No guides collection found.")
+            return {'CANCELLED'}
+
+        clipped_obj_count = 0
+        for obj in guides_coll.objects:
+            if obj.type != 'CURVE' or obj.name == HORIZON_CURVE_OBJ_NAME:
+                continue
+
+            curve = obj.data
+            was_changed = False
+            for spline in curve.splines:
+                if spline.type != 'POLY' or len(spline.points) < 2:
+                    continue
+
+                p0_world = obj.matrix_world @ Vector(spline.points[0].co[:3])
+                p1_world = obj.matrix_world @ Vector(spline.points[-1].co[:3])
+                
+                p0_ndc = world_to_camera_view(scene, cam, p0_world)
+                p1_ndc = world_to_camera_view(scene, cam, p1_world)
+                
+                clip_result = self.liang_barsky_clip((p0_ndc.x, p0_ndc.y), (p1_ndc.x, p1_ndc.y))
+
+                if clip_result is None:
+                    spline.points[0].co = (0, 0, 0, 1)
+                    spline.points[-1].co = (0, 0, 0, 1)
+                    was_changed = True
+                else:
+                    t_min, t_max = clip_result
+                    new_p0_world = p0_world.lerp(p1_world, t_min)
+                    new_p1_world = p0_world.lerp(p1_world, t_max)
+
+                    inv_matrix = obj.matrix_world.inverted()
+                    spline.points[0].co = list(inv_matrix @ new_p0_world) + [1.0]
+                    spline.points[-1].co = list(inv_matrix @ new_p1_world) + [1.0]
+                    was_changed = True
+
+            if was_changed:
+                curve.update_tag()
+                clipped_obj_count += 1
+
+        self.report({'INFO'}, f"Clipped {clipped_obj_count} guides to camera view.")
+        return {'FINISHED'}
+    
+
+#
+# ---------- START: REPLACE THIS ENTIRE CLASS IN YOUR SCRIPT ----------
+#
+
+class PERSPECTIVE_OT_clip_guides_custom_shape(bpy.types.Operator):
+    """Clips perspective guides to a custom shape boundary (updated to process every spline segment)"""
+    bl_idname = "perspective_splines.clip_guides_custom_shape"
+    bl_label = "Clip Guides to Custom Shape"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        ts = getattr(context.scene, "perspective_tool_settings_splines", None)
+        return ts and ts.custom_clipping_shape is not None
+
+    def execute(self, context):
+        scene = context.scene
+        ts = scene.perspective_tool_settings_splines
+        cam = scene.camera
+        shape_obj = ts.custom_clipping_shape
+
+        if not cam:
+            self.report({'WARNING'}, "No active camera.")
+            return {'CANCELLED'}
+        if not shape_obj or 'clipping_shape_type' not in shape_obj:
+            self.report({'ERROR'}, "A valid custom clipping shape must be selected.")
+            return {'CANCELLED'}
+
+        guides_coll = get_guides_collection(context)
+        clipped_obj_count = 0
+
+        # 1. Generate the precise 2D clipping polygon in camera space
+        shape_type = shape_obj['clipping_shape_type']
+        clip_polygon_2d_unsorted = []
+
+        if shape_type == 'RECTANGLE':
+            local_corners = [
+                Vector((-0.5, -0.5, 0)), Vector((0.5, -0.5, 0)),
+                Vector((0.5, 0.5, 0)),  Vector((-0.5, 0.5, 0))
+            ]
+            world_corners = [shape_obj.matrix_world @ c for c in local_corners]
+            ndc_corners = [world_to_camera_view(scene, cam, c) for c in world_corners]
+            clip_polygon_2d_unsorted = [Vector((c.x, c.y)) for c in ndc_corners]
+
+        elif shape_type == 'CIRCLE':
+            num_samples = 32
+            for i in range(num_samples):
+                angle = (2 * math.pi * i) / num_samples
+                local_pt = Vector((shape_obj.scale.x * math.cos(angle), shape_obj.scale.y * math.sin(angle), 0))
+                pt_world = shape_obj.matrix_world @ local_pt
+                pt_ndc = world_to_camera_view(scene, cam, pt_world)
+                clip_polygon_2d_unsorted.append(Vector((pt_ndc.x, pt_ndc.y)))
+
+        if not clip_polygon_2d_unsorted:
+            self.report({'ERROR'}, "Could not generate a 2D clipping polygon from the shape.")
+            return {'CANCELLED'}
+
+        # Force the projected polygon vertices into counter-clockwise order.
+        clip_polygon_2d = sort_polygon_ccw(clip_polygon_2d_unsorted)
+
+        # 2. Iterate through guide curves and clip them segment by segment.
+        for obj in guides_coll.objects:
+            if obj.type != 'CURVE' or obj.name == HORIZON_CURVE_OBJ_NAME:
+                continue
+
+            curve = obj.data
+            was_changed = False
+            new_spline_segments = []  # This will collect segments from all splines in the object.
+            inv_matrix = obj.matrix_world.inverted()
+
+            for spline in curve.splines:
+                if spline.type != 'POLY' or len(spline.points) < 2:
+                    continue
+
+                segments = clip_poly_spline_to_polygon(spline, obj.matrix_world, inv_matrix, clip_polygon_2d, scene, cam)
+                if segments:
+                    new_spline_segments.extend(segments)
+                # If a particular spline is entirely outside the polygon, we simply skip it.
+
+            # Rebuild the curve with the new segments.
+            if new_spline_segments:
+                # Remove existing splines
+                while len(curve.splines) > 0:
+                    curve.splines.remove(curve.splines[0])
+                # For each clipped segment, add a new poly spline with two points.
+                for seg in new_spline_segments:
+                    new_spline = curve.splines.new(type='POLY')
+                    # Ensure exactly two points are available
+                    if len(new_spline.points) < 2:
+                        new_spline.points.add(1)  # This creates a total of 2 points.
+                    new_spline.points[0].co = list(seg[0]) + [1.0]
+                    new_spline.points[1].co = list(seg[1]) + [1.0]
+                was_changed = True
+            else:
+                # If no segments remain inside the shape, clear this curve.
+                while len(curve.splines) > 0:
+                    curve.splines.remove(curve.splines[0])
+                was_changed = True
+
+            if was_changed:
+                curve.update_tag()
+                clipped_obj_count += 1
+
+        self.report({'INFO'}, f"Clipped {clipped_obj_count} guide object(s) to custom shape.")
+        return {'FINISHED'}
+
+
+#
+# ---------- END OF THE SECTION TO FIX ----------
+#
+
+
+class PERSPECTIVE_OT_delete_all_clipping_shapes(bpy.types.Operator):
+    """Finds and deletes all custom clipping shape helpers in the scene"""
+    bl_idname = "perspective_splines.delete_all_clipping_shapes"
+    bl_label = "Delete All Clipping Shapes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        # Check if any clipping shapes exist to be deleted
+        for obj in context.scene.objects:
+            if obj.get('clipping_shape_type'):
+                return True
+        return False
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        
+        shapes_to_delete = [
+            obj for obj in context.scene.objects if obj.get('clipping_shape_type')
+        ]
+
+        if not shapes_to_delete:
+            self.report({'INFO'}, "No clipping shapes found to delete.")
+            return {'CANCELLED'}
+
+        # If the currently assigned shape is in the list, clear the property first
+        if ts.custom_clipping_shape and ts.custom_clipping_shape in shapes_to_delete:
+            ts.custom_clipping_shape = None
+            
+        deleted_count = len(shapes_to_delete)
+        
+        # Deselect all and enter object mode to be safe
+        if context.active_object:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+
+        # Select and delete the shapes
+        for shape in shapes_to_delete:
+            shape.select_set(True)
+        
+        bpy.ops.object.delete()
+
+        self.report({'INFO'}, f"Deleted {deleted_count} clipping shape(s).")
+        return {'FINISHED'}
+
+
+
+class PERSPECTIVE_OT_create_clipping_shape(bpy.types.Operator):
+    """Creates a helper Empty object to be used as a custom clipping boundary"""
+    bl_idname = "perspective_splines.create_clipping_shape"
+    bl_label = "Create Clipping Shape"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        shape_type = ts.clipping_shape_type_to_add
+
+        # Create the main empty object at the cursor location
+        bpy.ops.object.empty_add(
+            type='CUBE', # A cube is a good visual representation
+            align='WORLD', 
+            location=context.scene.cursor.location
+        )
+        shape_obj = context.active_object
+        
+        # This custom property is CRUCIAL. It's how we identify our shapes.
+        shape_obj['clipping_shape_type'] = shape_type 
+        
+        shape_obj.name = f"ClippingShape_{shape_type.title()}"
+        shape_obj.empty_display_size = 2 # Make it easy to see
+        shape_obj.color = (0.2, 1.0, 0.8, 1.0) # Give it a distinct color
+
+        # Set default size based on type
+        if shape_type == 'RECTANGLE':
+            shape_obj.scale = (4, 2, 1) # A wide rectangle
+        else: # CIRCLE
+            shape_obj.empty_display_type = 'CIRCLE'
+            shape_obj.scale = (3, 3, 3) # A uniform circle
+
+        # Automatically assign the newly created shape to the tool settings
+        ts.custom_clipping_shape = shape_obj
+
+        self.report({'INFO'}, f"Created {shape_type.title()} Clipping Shape.")
+        return {'FINISHED'}
 
 class PERSPECTIVE_OT_delete_all_helpers(bpy.types.Operator):
     """Deletes ALL helper empties from the aids collection."""
@@ -2057,107 +2436,6 @@ class PERSPECTIVE_OT_extract_1p_from_selected_empties(bpy.types.Operator):
                 return {'CANCELLED'}
 
 
-
-class PERSPECTIVE_OT_clip_guides_to_camera(bpy.types.Operator):
-    """Clips each perspective guide so that its endpoints lie exactly on the camera borders."""
-    bl_idname = "perspective_splines.clip_guides_to_camera"
-    bl_label = "Clip Guides to Camera Borders"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def liang_barsky_clip(self, A, B):
-        """
-        Liang–Barsky clipping in 2D.
-        A and B are 2D tuples representing the projected endpoints (x,y) in normalized camera space.
-        Returns (t_min, t_max) such that:
-          clipped_point = A + t*(B-A) for t in [t_min, t_max].
-        If the line does not cross the unit square, returns None.
-        """
-        dx = B[0] - A[0]
-        dy = B[1] - A[1]
-        t_min = 0.0
-        t_max = 1.0
-
-        p = [-dx, dx, -dy, dy]
-        q = [A[0], 1 - A[0], A[1], 1 - A[1]]
-
-        for i in range(4):
-            if p[i] == 0:
-                if q[i] < 0:
-                    return None  # Parallel and outside
-            else:
-                r = q[i] / p[i]
-                if p[i] < 0:
-                    t_min = max(t_min, r)
-                else:
-                    t_max = min(t_max, r)
-                if t_min > t_max:
-                    return None  # No intersection
-        return t_min, t_max
-
-    def execute(self, context):
-        scene = context.scene
-        cam = scene.camera
-        if not cam:
-            self.report({'WARNING'}, "No active camera detected.")
-            return {'CANCELLED'}
-        
-        # Get guides collection (assumes you have a helper function get_guides_collection)
-        guides_coll = get_guides_collection(context)
-        if not guides_coll:
-            self.report({'WARNING'}, "No guides collection found.")
-            return {'CANCELLED'}
-
-        trimmed_obj_count = 0
-
-        # Loop over all guide objects in your guides collection (skip the horizon line)
-        for obj in guides_coll.objects:
-            if obj.type != 'CURVE' or obj.name == "VISUAL_Horizon_Line":
-                continue
-
-            curve = obj.data
-            change_flag = False
-            # Loop over every spline in the curve (assuming your guides are POLY curves with at least 2 points)
-            for spline in curve.splines:
-                if spline.type != 'POLY' or len(spline.points) < 2:
-                    continue
-
-                # Get the endpoints in world space
-                pt0_world = obj.matrix_world @ Vector(spline.points[0].co[:3])
-                pt1_world = obj.matrix_world @ Vector(spline.points[-1].co[:3])
-                
-                # Project endpoints to normalized camera space (NDC)
-                A_ndc = world_to_camera_view(scene, cam, pt0_world)
-                B_ndc = world_to_camera_view(scene, cam, pt1_world)
-                
-                # Only use the x and y components for 2D clipping
-                clip_result = self.liang_barsky_clip((A_ndc.x, A_ndc.y), (B_ndc.x, B_ndc.y))
-                if clip_result is None:
-                    # If the guide does not cross through the view, you may choose to hide it or set its endpoints to a dummy value.
-                    # Here we set both endpoints to the same 0-vector in local space to effectively collapse the guide.
-                    spline.points[0].co = (0, 0, 0, 1)
-                    spline.points[-1].co = (0, 0, 0, 1)
-                    change_flag = True
-                else:
-                    t_min, t_max = clip_result
-                    # Find the new world positions via linear interpolation
-                    new_pt0_world = pt0_world + (pt1_world - pt0_world) * t_min
-                    new_pt1_world = pt0_world + (pt1_world - pt0_world) * t_max
-
-                    # Convert these world positions back to the object's local space
-                    inv_world = obj.matrix_world.inverted()
-                    new_pt0_local = inv_world @ new_pt0_world
-                    new_pt1_local = inv_world @ new_pt1_world
-
-                    spline.points[0].co = (new_pt0_local.x, new_pt0_local.y, new_pt0_local.z, 1)
-                    spline.points[-1].co = (new_pt1_local.x, new_pt1_local.y, new_pt1_local.z, 1)
-                    change_flag = True
-
-            if change_flag:
-                curve.update_tag()
-                trimmed_obj_count += 1
-
-        self.report({'INFO'}, f"Clipped guides in {trimmed_obj_count} object(s).")
-        return {'FINISHED'}
 
 
 class PERSPECTIVE_OT_clear_grid_planes(Operator):
@@ -3165,197 +3443,6 @@ class PERSPECTIVE_OT_generate_2p_vertical_lines(Operator):
     
 # (Around line 1050, after generate_two_point and before generate_fish_eye)
 
-class PERSPECTIVE_OT_create_3p_vps_if_needed(Operator):
-    """Helper to ensure 3P VPs exist, called by specific 3P line generators."""
-    bl_idname = "perspective_splines.create_3p_vps_if_needed"
-    bl_label = "Ensure 3P VPs"
-    bl_options = {'REGISTER', 'INTERNAL'} # Internal, not for UI
-
-    @classmethod
-    def create_default_three_point_vps(cls, context):
-        print("DEBUG: create_default_three_point_vps CALLED")
-        ts = context.scene.perspective_tool_settings_splines
-        h_pref = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_H']
-        v_pref = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_V']
-
-        horizon_z_level = ts.horizon_y_level
-        horizon_ctrl = get_horizon_control_object()
-        if not horizon_ctrl:
-            print("DEBUG create_default_three_point_vps: No horizon control, generating one.")
-            bpy.ops.perspective_splines.generate_horizon('EXEC_DEFAULT')
-            horizon_ctrl = get_horizon_control_object()
-        
-        if horizon_ctrl:
-            horizon_z_level = horizon_ctrl.location.z
-            if abs(ts.horizon_y_level - horizon_z_level) > 0.001:
-                ts.horizon_y_level = horizon_z_level
-                print(f"DEBUG create_default_three_point_vps: Synced ts.horizon_y_level to Horizon Control Z: {horizon_z_level}")
-        else:
-            print("DEBUG create_default_three_point_vps: Failed to ensure horizon control.")
-
-        print(f"DEBUG create_default_three_point_vps: Target horizon Z for H_VPs: {horizon_z_level}")
-
-        vp_h1_name = h_pref + "_1"
-        vp_h2_name = h_pref + "_2"
-        vp_v_name = v_pref + "_1"
-
-        vp_definitions = [
-            {"name": vp_h1_name, "default_offset": Vector((-10.0, 0.0, 0.0)), "color_prop": ts.three_point_vp_h1_empty_color, "is_horizontal": True},
-            {"name": vp_h2_name, "default_offset": Vector((10.0, 0.0, 0.0)),  "color_prop": ts.three_point_vp_h2_empty_color, "is_horizontal": True},
-            {"name": vp_v_name,  "default_offset": Vector((0.0, 0.0, -10.0)), "color_prop": ts.three_point_vp_v_empty_color, "is_horizontal": False}
-        ]
-        
-        for vp_def in vp_definitions:
-            vp_name = vp_def["name"]
-            vp_color = vp_def["color_prop"]
-            is_horizontal_vp = vp_def["is_horizontal"]
-            existing_vp = bpy.data.objects.get(vp_name)
-
-            current_loc_for_vp = Vector(vp_def["default_offset"]) # Start with offset
-            if is_horizontal_vp:
-                current_loc_for_vp.z = horizon_z_level # Set Z to horizon
-            else: # Vertical VP
-                # Center X between H VPs if they exist, add Z offset to horizon
-                h_vp1 = bpy.data.objects.get(vp_h1_name)
-                h_vp2 = bpy.data.objects.get(vp_h2_name)
-                avg_h_x = 0.0
-                if h_vp1 and h_vp2: avg_h_x = (h_vp1.location.x + h_vp2.location.x) / 2.0
-                elif h_vp1: avg_h_x = h_vp1.location.x
-                elif h_vp2: avg_h_x = h_vp2.location.x
-                current_loc_for_vp.x += avg_h_x # Add offset to average (or 0 if no H_VPs)
-                current_loc_for_vp.z += horizon_z_level # Z offset is relative to horizon
-
-
-            if existing_vp:
-                print(f"DEBUG create_default_three_point_vps: VP '{vp_name}' exists. Ensuring location & color.")
-                target_loc = existing_vp.location.copy()
-                if is_horizontal_vp: # Snap existing horizontal VPs to horizon
-                    if abs(target_loc.z - horizon_z_level) > 0.001:
-                        target_loc.z = horizon_z_level
-                # For vertical VP, if it exists, we largely preserve its full location.
-                # The default_offset logic above is more for initial creation.
-                # However, one might argue its X should also align with H_VPs if H_VPs moved. This is a design choice.
-                # For now, if V_VP exists, its manually set position is respected.
-                add_vp_empty_if_missing(context, vp_name, target_loc, vp_color)
-            else:
-                print(f"DEBUG create_default_three_point_vps: Creating NEW VP: '{vp_name}' at {current_loc_for_vp}")
-                add_vp_empty_if_missing(context, vp_name, current_loc_for_vp, vp_color)
-
-
-    def execute(self, context):
-        PERSPECTIVE_OT_create_3p_vps_if_needed.create_default_three_point_vps(context)
-        return {'FINISHED'}
-
-
-class PERSPECTIVE_OT_generate_3p_h1_lines(Operator):
-    bl_idname = "perspective_splines.generate_3p_h1_lines"
-    bl_label = "Generate 3P H-VP1 Lines"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        ts = context.scene.perspective_tool_settings_splines
-        bpy.ops.perspective_splines.create_3p_vps_if_needed() # Ensure VPs exist
-
-        vps_h = get_vanishing_points('THREE_POINT_H')
-        if not vps_h:
-            self.report({'ERROR'}, "3P H-VP1 not found. Create VPs first."); return {'CANCELLED'}
-        vp_h1 = vps_h[0] # Assumes sorted, VP_3P_H_1
-
-        guides_coll = get_guides_collection(context)
-        clear_guides_with_prefix(context, ["3P_Guides_H1"]) # Clear only H1 lines
-        ext = ts.three_point_line_extension
-        
-        lines_data = generate_radial_lines_in_plane(vp_h1.location.copy(), ts.three_point_vp_h1_density, ext, 'XZ')
-        if not lines_data:
-            self.report({'INFO'}, "No H1 lines to generate."); return {'FINISHED'}
-        
-        opac = ts.guide_curves_opacity
-        created_count = 0
-        for i, pts_list in enumerate(lines_data):
-            if create_curve_object(context, f"3P_Guides_H1_{i+1}", [pts_list], guides_coll, ts.guide_curves_thickness, opac):
-                created_count += 1
-        self.report({'INFO'}, f"Generated {created_count} 3P H-VP1 lines.")
-        update_dynamic_horizon_line_curve(context)
-        return {'FINISHED'}
-
-class PERSPECTIVE_OT_generate_3p_h2_lines(bpy.types.Operator):
-    """Generate guide curves for the second horizontal VP in Three-Point Perspective."""
-    bl_idname = "perspective_splines.generate_3p_h2_lines"
-    bl_label = "Generate 3P H-VP2 Lines"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        ts = context.scene.perspective_tool_settings_splines
-        bpy.ops.perspective_splines.create_3p_vps_if_needed()  # Ensure all 3P VPs exist
-
-        vps_h = get_vanishing_points('THREE_POINT_H')
-        if len(vps_h) < 2:
-            self.report({'ERROR'}, "3P H-VP2 not found. Create VPs first.")
-            return {'CANCELLED'}
-        vp_h2 = vps_h[1]  # Expecting VP_3P_H_2 to be the second horizontal VP.
-        print("DEBUG VP2: VP_3P_H_2 location:", vp_h2.location)
-
-        guides_coll = get_guides_collection(context)
-        clear_guides_with_prefix(context, ["3P_Guides_H2"])
-        ext = ts.three_point_line_extension
-
-        lines_data = generate_radial_lines_in_plane(vp_h2.location.copy(), ts.three_point_vp_h2_density, ext, 'XZ')
-        print("DEBUG VP2: Generated lines_data =", lines_data)
-        if not lines_data:
-            self.report({'INFO'}, "No H2 lines to generate.")
-            return {'FINISHED'}
-
-        opac = ts.guide_curves_opacity
-        created_count = 0
-        for i, pts_list in enumerate(lines_data):
-            # For debugging, check if forcing a color makes it visible.
-            new_curve = create_curve_object(context, f"3P_Guides_H2_{i+1}", [pts_list], guides_coll,
-                                             ts.guide_curves_thickness, opac, color_rgb=(1.0, 0.0, 0.0))
-            if new_curve:
-                print(f"DEBUG VP2: Created guide curve {new_curve.name}")
-                created_count += 1
-            else:
-                print(f"DEBUG VP2: Failed to create guide curve for index {i+1}")
-        self.report({'INFO'}, f"Generated {created_count} 3P H-VP2 lines.")
-        context.area.tag_redraw()
-        return {'FINISHED'}
-
-
-
-class PERSPECTIVE_OT_generate_3p_v_lines(Operator):
-    bl_idname = "perspective_splines.generate_3p_v_lines"
-    bl_label = "Generate 3P V-VP Lines"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        ts = context.scene.perspective_tool_settings_splines
-        bpy.ops.perspective_splines.create_3p_vps_if_needed()
-
-        vps_v = get_vanishing_points('THREE_POINT_V')
-        if not vps_v:
-            self.report({'ERROR'}, "3P V-VP not found. Create VPs first."); return {'CANCELLED'}
-        vp_v1 = vps_v[0]
-
-        guides_coll = get_guides_collection(context)
-        clear_guides_with_prefix(context, ["3P_Guides_V"])
-        ext = ts.three_point_line_extension
-
-        lines_data = generate_radial_lines_in_plane(vp_v1.location.copy(), ts.three_point_vp_v_density, ext, 'XZ')
-        if not lines_data:
-            self.report({'INFO'}, "No V lines to generate."); return {'FINISHED'}
-
-        opac = ts.guide_curves_opacity
-        created_count = 0
-        for i, pts_list in enumerate(lines_data):
-            if create_curve_object(context, f"3P_Guides_V_{i+1}", [pts_list], guides_coll, ts.guide_curves_thickness, opac):
-                created_count +=1
-        self.report({'INFO'}, f"Generated {created_count} 3P V-VP lines.")
-        update_dynamic_horizon_line_curve(context) # V-VP doesn't define horizon, but good to update
-        return {'FINISHED'}    
-
-
-# (This class is after the 3P line generation operators and before align_camera)
-
 class PERSPECTIVE_OT_generate_fish_eye_splines(Operator):
     bl_idname = "perspective_splines.generate_fish_eye"
     bl_label = "Generate FE Lines"
@@ -3363,123 +3450,153 @@ class PERSPECTIVE_OT_generate_fish_eye_splines(Operator):
 
     @classmethod
     def create_default_fish_eye_center(cls, context):
-        print("DEBUG FishEye: create_default_fish_eye_center CALLED")
         ts = context.scene.perspective_tool_settings_splines
-        helpers_coll = get_helpers_collection(context) # Ensure helpers collection exists
-
-        fe_vp_name = VP_TYPE_SPECIFIC_PREFIX_MAP['FISH_EYE'] + "_1" # e.g., VP_FE_Center_1
-        
-        # Determine color for the VP empty
-        vp_color = (0.5, 0.2, 0.8, 1.0) # Default if property doesn't exist
-        if hasattr(ts, 'fish_eye_vp_empty_color'):
-            vp_color = list(ts.fish_eye_vp_empty_color)
-        
+        helpers_coll = get_helpers_collection(context)
+        fe_vp_name = VP_TYPE_SPECIFIC_PREFIX_MAP['FISH_EYE'] + "_1"
+        vp_color = list(ts.fish_eye_vp_empty_color) if hasattr(ts, 'fish_eye_vp_empty_color') else (0.5, 0.2, 0.8, 1.0)
         existing_vp = bpy.data.objects.get(fe_vp_name)
-        
         if existing_vp:
-            print(f"DEBUG FishEye: VP {fe_vp_name} exists. Preserving location: {existing_vp.location}")
-            # Ensure it's in the correct collection
             if existing_vp.name not in helpers_coll.objects:
                 for coll in existing_vp.users_collection:
                     if coll != helpers_coll:
                         coll.objects.unlink(existing_vp)
                 helpers_coll.objects.link(existing_vp)
-            
-            # Update color if different from setting
-            current_color_tuple = tuple(round(c, 4) for c in existing_vp.color)
-            setting_color_tuple = tuple(round(c, 4) for c in vp_color)
-            if current_color_tuple != setting_color_tuple:
-                print(f"DEBUG FishEye: Updating color for existing VP {existing_vp.name}")
-                existing_vp.color = vp_color # Already a list or tuple
-                update_vp_empty_colors(ts, context) # Call master color update
+            if tuple(round(c, 4) for c in existing_vp.color) != tuple(round(c, 4) for c in vp_color):
+                existing_vp.color = vp_color
+                update_vp_empty_colors(ts, context)
         else:
-            # VP does not exist, create it at world origin (user can move it)
             default_loc = Vector((0.0, 0.0, 0.0))
-            print(f"DEBUG FishEye: Creating NEW VP: {fe_vp_name} at {default_loc}")
             new_vp = add_vp_empty_if_missing(context, fe_vp_name, default_loc, vp_color)
             if new_vp:
-                update_vp_empty_colors(ts, context) # Call master color update
-            else:
-                print(f"DEBUG FishEye: FAILED to create VP {fe_vp_name}")
-        
-        # FishEye typically doesn't have a horizon line in the same way,
-        # but call update_dynamic_horizon_line_curve anyway in case it has a default behavior for 'NONE'
-        # or if other types of horizon logic might apply. It will hide if no points are set.
+                update_vp_empty_colors(ts, context)
         update_dynamic_horizon_line_curve(context)
 
-
     def execute(self, context):
-        print("DEBUG FishEye: Execute operator CALLED")
+        from mathutils import Euler
         ts = context.scene.perspective_tool_settings_splines
-        
-        # Ensure the center VP exists or is created
-        PERSPECTIVE_OT_generate_fish_eye_splines.create_default_fish_eye_center(context)
-        
-        fe_centers = get_vanishing_points('FISH_EYE') 
-        if not fe_centers: 
-            print("DEBUG FishEye Execute: FE Center VP NOT found after attempting creation.")
-            self.report({'ERROR'}, "FE Center VP not found. Cannot generate lines."); return {'CANCELLED'}
-        
-        fe_center_obj = fe_centers[0] # Should be VP_FE_Center_1
-        print(f"DEBUG FishEye Execute: Using FE Center VP: {fe_center_obj.name} at {fe_center_obj.location}")
-        
+        self.create_default_fish_eye_center(context)
+        fe_centers = get_vanishing_points('FISH_EYE')
+        if not fe_centers:
+            self.report({'ERROR'}, "FE Center VP not found. Cannot generate lines.")
+            return {'CANCELLED'}
+        fe_center_obj = fe_centers[0]
         guides_coll = get_guides_collection(context)
-        clear_guides_with_prefix(context, ["FE_Guides_"]) # Clear only FE guides (added underscore)
-        
-        center_loc = fe_center_obj.location.copy() # Use the current location of the VP
-        n_lon, n_lat = ts.fish_eye_grid_radial, ts.fish_eye_grid_concentric
-        segs, radius, h_scale = ts.fish_eye_segments_per_curve, ts.fish_eye_grid_radius, ts.fish_eye_horizontal_scale
-        curves_data_to_create = [] 
+        clear_guides_with_prefix(context, ["FE_Guides_"])
+        center_loc = fe_center_obj.location.copy()
+        n_lon = ts.fish_eye_grid_radial
+        n_lat = ts.fish_eye_grid_concentric
+        segs = ts.fish_eye_segments_per_curve
+        radius = ts.fish_eye_grid_radius
+        h_scale = ts.fish_eye_horizontal_scale
+        front_only = getattr(ts, "fish_eye_front_only", True)
+        draw_1p = getattr(ts, "fish_eye_draw_1p", True)
 
-        print(f"DEBUG FishEye Execute: n_lon={n_lon}, n_lat={n_lat}, draw_latitude={ts.fish_eye_draw_latitude}, radius={radius}")
+        # 1. Main sphere now uses a fixed default rotation.
+        rot_euler = Euler((math.radians(90.0), math.radians(90.0), 0.0), 'XYZ')
 
-        if n_lon > 0 and segs > 1: 
-            print(f"DEBUG FishEye Execute: Generating {n_lon} longitude lines...")
+        # 2. Get the new user-controlled orientation for the 1P grid.
+        rot_1p_x = math.radians(getattr(ts, "one_point_orientation_x", 90.0))
+        rot_1p_y = math.radians(getattr(ts, "one_point_orientation_y", 90.0))
+        rot_1p_z = math.radians(getattr(ts, "one_point_orientation_z", 0.0))
+        one_point_rot_euler = Euler((rot_1p_x, rot_1p_y, rot_1p_z), 'XYZ')
+
+        curves_data_to_create = []
+
+        # --- Generate longitude and latitude lines ---
+        if n_lon > 0 and segs > 1:
             for i in range(n_lon):
-                phi = (2 * math.pi * i) / n_lon 
+                phi = (2 * math.pi * i) / n_lon
                 pts_longitude = []
-                for j in range(segs + 1): 
-                    theta = math.pi * j / segs 
-                    x = radius * math.sin(theta) * math.cos(phi) * h_scale
-                    y = radius * math.sin(theta) * math.sin(phi) 
-                    z = radius * math.cos(theta)
-                    # Add to the VP's current location
-                    pts_longitude.append(center_loc + Vector((x,y,z))) 
-                curves_data_to_create.append({'points_list': [pts_longitude], 'is_cyclic': False, 'name_suffix': f"Lon_{i}"})
-        
-        if ts.fish_eye_draw_latitude and n_lat > 0 and segs > 1: 
-            print(f"DEBUG FishEye Execute: Generating {n_lat} latitude lines...")
-            for i in range(1, n_lat + 1): 
-                theta = math.pi * i / (n_lat + 1) 
-                ring_radius_at_z = radius * math.sin(theta)
-                z_offset_from_center = radius * math.cos(theta)
+                for j in range(segs + 1):
+                    theta = math.pi * j / segs
+                    x = radius * math.cos(theta)
+                    y = radius * math.sin(theta) * math.cos(phi) * h_scale
+                    z = radius * math.sin(theta) * math.sin(phi)
+                    pt = Vector((x, y, z))
+                    pt_rot = pt.copy()
+                    pt_rot.rotate(rot_euler) # Apply fixed sphere rotation
+                    if front_only and pt_rot.y > 0:
+                        continue
+                    pts_longitude.append(center_loc + pt_rot)
+                if len(pts_longitude) > 1:
+                    curves_data_to_create.append({'points_list': [pts_longitude], 'is_cyclic': False, 'name_suffix': f"Lon_{i}"})
+
+        if ts.fish_eye_draw_latitude and n_lat > 0 and segs > 1:
+            for i in range(1, n_lat + 1):
+                theta = math.pi * i / (n_lat + 1)
+                ring_radius = radius * math.sin(theta)
+                x = radius * math.cos(theta)
+                pt_lat = Vector((x, 0, 0))
+                pt_lat_rot = pt_lat.copy()
+                pt_lat_rot.rotate(rot_euler) # Apply fixed sphere rotation
+                if front_only and pt_lat_rot.y > 0:
+                    continue
                 pts_latitude = []
-                for j in range(segs + 1): 
-                    phi = (2 * math.pi * j) / segs 
-                    x = ring_radius_at_z * math.cos(phi) * h_scale
-                    y = ring_radius_at_z * math.sin(phi)
-                    z_coord = z_offset_from_center # This is relative to the sphere's own center
-                    # Add to the VP's current location
-                    pts_latitude.append(center_loc + Vector((x,y,z_coord)))
-                curves_data_to_create.append({'points_list': [pts_latitude], 'is_cyclic': True, 'name_suffix': f"Lat_{i}"})
-        
-        if not curves_data_to_create: 
-            print("DEBUG FishEye Execute: No curve data was generated for FE lines.")
-            self.report({'INFO'}, "No Fish Eye lines to generate based on current settings."); return {'FINISHED'}
-        
-        print(f"DEBUG FishEye Execute: Attempting to create {len(curves_data_to_create)} FE curve objects.")
-        opac = ts.guide_curves_opacity 
+                for j in range(segs + 1):
+                    phi = (2 * math.pi * j) / segs
+                    y = ring_radius * math.cos(phi) * h_scale
+                    z = ring_radius * math.sin(phi)
+                    pt = Vector((x, y, z))
+                    pt_rot = pt.copy()
+                    pt_rot.rotate(rot_euler) # Apply fixed sphere rotation
+                    if front_only and pt_rot.y > 0:
+                        continue
+                    pts_latitude.append(center_loc + pt_rot)
+                if len(pts_latitude) > 1:
+                    curves_data_to_create.append({'points_list': [pts_latitude], 'is_cyclic': True, 'name_suffix': f"Lat_{i}"})
+
+        if draw_1p:
+            theta = math.pi / 2
+            ring_radius = radius * math.sin(theta)
+            x = radius * math.cos(theta)
+            pts_equator = []
+            for j in range(segs + 1):
+                phi = (2 * math.pi * j) / segs
+                y = ring_radius * math.cos(phi) * h_scale
+                z = ring_radius * math.sin(phi)
+                pt = Vector((x, y, z))
+                pt_rot = pt.copy()
+                pt_rot.rotate(rot_euler) # Apply fixed sphere rotation
+                pts_equator.append(center_loc + pt_rot)
+            if len(pts_equator) > 1:
+                curves_data_to_create.append({'points_list': [pts_equator], 'is_cyclic': True, 'name_suffix': "1P_Boundary"})
+
+        # --- 1P radial lines with new user-controlled orientation ---
+        one_point_density = getattr(ts, "one_point_grid_density_radial", 16)
+        one_point_length = radius
+        if draw_1p and one_point_density > 0:
+            for i in range(one_point_density):
+                angle = 2 * math.pi * i / one_point_density
+                pt_start = Vector((0, 0, 0))
+
+                # Create the base grid flat on the XY plane.
+                pt_end = Vector((one_point_length * math.cos(angle) * h_scale, one_point_length * math.sin(angle), 0.0))
+
+                pt_start_rot = pt_start.copy()
+                pt_end_rot = pt_end.copy()
+
+                # Apply the new user-controlled rotation for the 1P grid.
+                pt_start_rot.rotate(one_point_rot_euler)
+                pt_end_rot.rotate(one_point_rot_euler)
+
+                curves_data_to_create.append({
+                    'points_list': [[center_loc + pt_start_rot, center_loc + pt_end_rot]],
+                    'is_cyclic': False,
+                    'name_suffix': f"1P_Radial_{i+1}"
+                })
+
+        opac = ts.guide_curves_opacity
         thickness = ts.guide_curves_thickness
         created_count = 0
         for i, curve_def in enumerate(curves_data_to_create):
             obj_name = f"FE_Guides_{curve_def['name_suffix']}"
-            # create_curve_object uses random colors by default if color_rgb is not passed
             if create_curve_object(context, obj_name, curve_def['points_list'], guides_coll,
-                                thickness, opac, is_cyclic=curve_def['is_cyclic'], curve_type='BEZIER'):
-                created_count +=1
-        
+                                  thickness, opac, is_cyclic=curve_def['is_cyclic'], curve_type='BEZIER'):
+                created_count += 1
+
         self.report({'INFO'}, f"Generated {created_count} Fish Eye line objects.")
         return {'FINISHED'}
+    
 
 class PERSPECTIVE_OT_align_camera_splines(Operator):
     bl_idname = "perspective_splines.align_camera"
@@ -3642,12 +3759,14 @@ class VIEW3D_PT_rogue_perspective_grids(Panel):
 
 
 
+# Replace the existing VIEW3D_PT_rogue_perspective_trimmer class
+
 class VIEW3D_PT_rogue_perspective_trimmer(bpy.types.Panel):
     bl_label = "Guide Clipper"
     bl_idname = "VIEW3D_PT_rogue_perspective_trimmer"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'RogueAI'
+    bl_category = "RogueAI"
     bl_parent_id = "VIEW3D_PT_rogue_perspective_ai"
     bl_options = {'DEFAULT_CLOSED'}
 
@@ -3655,18 +3774,33 @@ class VIEW3D_PT_rogue_perspective_trimmer(bpy.types.Panel):
         layout = self.layout
         ts = getattr(context.scene, "perspective_tool_settings_splines", None)
         if not ts:
-            layout.label(text="Perspective settings not found.")
+            layout.label(text="Perspective settings not found.", icon='ERROR')
             return
 
-        main_box = layout.box()
-        col_main = main_box.column(align=True)
+        # --- Camera Clipping Section ---
+        cam_box = layout.box()
+        cam_box.label(text="Clip to Camera Borders:")
+        cam_box.operator("perspective_splines.clip_guides_to_camera", 
+                           text="Clip to Camera", icon='CAMERA_DATA')
+        
+        # --- Custom Shape Clipping Section ---
+        shape_box = layout.box()
+        shape_box.label(text="Clip to Custom Shape:")
+        shape_box.prop(ts, "custom_clipping_shape")
+        
+        # Always show the operator button, even if no shape is yet selected
+        shape_box.operator("perspective_splines.clip_guides_custom_shape", 
+                             text="Clip to Custom Shape", icon='MOD_LENGTH')
+        
+        # Also provide buttons to create or delete a clipping shape helper:
+        add_box = shape_box.box()
+        row = add_box.row(align=True)
+        row.prop(ts, "clipping_shape_type_to_add", text="")
+        row.operator("perspective_splines.create_clipping_shape", text="Create", icon='ADD')
+        del_row = add_box.row(align=True)
+        del_row.operator("perspective_splines.delete_all_clipping_shapes", 
+                         text="Delete All Shapes", icon='TRASH')
 
-        col_main.label(text="Clip Guides to Camera Borders:")
-        col_main.operator(
-            "perspective_splines.clip_guides_to_camera",
-            text="Clip Now",
-            icon='MOD_LENGTH'
-        )
 
 
     
@@ -4131,15 +4265,38 @@ class Rogue_Perspective_AI_PT_main(Panel):
         col.prop(settings, "fish_eye_vp_empty_color", text="VP Empty Color")
         col.separator()
         col.prop(settings, "fish_eye_grid_radius")
-        
+
         row_grid_lines = col.row(align=True)
         row_grid_lines.prop(settings, "fish_eye_grid_radial", text="Longitudes")
         row_grid_lines.prop(settings, "fish_eye_grid_concentric", text="Latitudes")
-        
+
         col.prop(settings, "fish_eye_segments_per_curve")
         col.prop(settings, "fish_eye_horizontal_scale")
         col.prop(settings, "fish_eye_draw_latitude", toggle=True)
+        col.prop(settings, "fish_eye_front_only", text="Front Only")
+
+        col.separator()
+        # Box for 1P specific settings
+        one_p_box = col.box()
         
+        # --- START OF FIX ---
+        # 1. The main checkbox is drawn first and is ALWAYS enabled.
+        one_p_box.prop(settings, "fish_eye_draw_1p", text="Draw 1P at Center")
+
+        # 2. A new column is created for the sliders.
+        col_1p_settings = one_p_box.column()
+
+        # 3. This new column is enabled/disabled based on the checkbox state.
+        col_1p_settings.enabled = settings.fish_eye_draw_1p
+
+        # 4. The sliders are placed inside this conditional column.
+        col_1p_settings.label(text="1P Grid Orientation:")
+        row_1p_rot = col_1p_settings.row(align=True)
+        row_1p_rot.prop(settings, "one_point_orientation_x", text="X")
+        row_1p_rot.prop(settings, "one_point_orientation_y", text="Y")
+        row_1p_rot.prop(settings, "one_point_orientation_z", text="Z")
+        # --- END OF FIX ---
+
         box.operator("perspective_splines.generate_fish_eye", text="Generate/Update Fish Eye Lines", icon='MESH_UVSPHERE')
     
         
@@ -4304,11 +4461,17 @@ def perspective_depsgraph_handler_splines(scene, depsgraph):
 
 # Updated classes_splines tuple that includes the new operators
 
+# --- Replacement for your classes_splines tuple ---
+
+#
+# ------------------ START: Fully Updated classes_splines Tuple ------------------
+#
+
 classes_splines = (
     # --- Property Group ---
     PerspectiveToolSettingsSplines,
 
-    # --- Generation and Setup Operators ---
+    # --- Main Generation and Setup Operators ---
     PERSPECTIVE_OT_generate_horizon_spline,
     PERSPECTIVE_OT_add_vanishing_point_empty,
     PERSPECTIVE_OT_generate_one_point_splines,
@@ -4318,40 +4481,41 @@ classes_splines = (
     PERSPECTIVE_OT_generate_2p_vertical_lines,
     PERSPECTIVE_OT_create_3p_vps_if_needed,
     PERSPECTIVE_OT_generate_3p_h1_lines,
-    PERSPECTIVE_OT_add_3p_h_vp1_helpers,
-    PERSPECTIVE_OT_extract_3p_h_vp1_from_empties,
-    
-    # --- New 3P Operators for VP2 and Vertical ---
-    PERSPECTIVE_OT_add_3p_h_vp2_helpers,
-    PERSPECTIVE_OT_extract_3p_h_vp2_from_empties,
-    PERSPECTIVE_OT_add_3p_v_vp_helpers,
-    PERSPECTIVE_OT_extract_3p_v_from_empties,
-    PERSPECTIVE_OT_generate_3p_h2_lines,  # <-- Add this line!
+    PERSPECTIVE_OT_generate_3p_h2_lines,
     PERSPECTIVE_OT_generate_3p_v_lines,
-
-    # --- Other Generation Operators ---
     PERSPECTIVE_OT_generate_fish_eye_splines,
-    PERSPECTIVE_OT_align_camera_splines,
+    
+    # --- Construction, Clipping, and Alignment ---
     PERSPECTIVE_OT_create_box_grid,
-    PERSPECTIVE_OT_clip_guides_to_camera,
+    PERSPECTIVE_OT_align_camera_splines,
+    PERSPECTIVE_OT_create_clipping_shape,
+    PERSPECTIVE_OT_delete_all_clipping_shapes,
+    PERSPECTIVE_OT_clip_guides_to_camera,       # The restored dedicated camera clipper
+    PERSPECTIVE_OT_clip_guides_custom_shape,    # The new dedicated custom shape clipper
 
-    # --- Extraction (from empties) Operators for 1P and 2P ---
+    # --- VP Extraction (from Empties) Operators ---
     PERSPECTIVE_OT_add_1p_extraction_empties,
     PERSPECTIVE_OT_extract_1p_from_selected_empties,
     PERSPECTIVE_OT_add_2p_vp1_helpers,
     PERSPECTIVE_OT_extract_2p_vp1_from_empties,
     PERSPECTIVE_OT_add_2p_vp2_helpers,
     PERSPECTIVE_OT_extract_2p_vp2_from_empties,
-    
-    # --- Refresh and Helper Management Operators ---
+    PERSPECTIVE_OT_add_3p_h_vp1_helpers,
+    PERSPECTIVE_OT_extract_3p_h_vp1_from_empties,
+    PERSPECTIVE_OT_add_3p_h_vp2_helpers,
+    PERSPECTIVE_OT_extract_3p_h_vp2_from_empties,
+    PERSPECTIVE_OT_add_3p_v_vp_helpers,
+    PERSPECTIVE_OT_extract_3p_v_from_empties,
+
+    # --- Helper & Aid Management Operators ---
     PERSPECTIVE_OT_refresh_extraction_aids,
     PERSPECTIVE_OT_toggle_all_helpers,
     PERSPECTIVE_OT_delete_all_helpers,
     PERSPECTIVE_OT_select_helper_empties,
-
-    # --- Clearing and Merging Operators ---
-    PERSPECTIVE_OT_clear_grid_planes,
     PERSPECTIVE_OT_remove_selected_helper_empty,
+
+    # --- Clearing, Merging, and Toggling Operators ---
+    PERSPECTIVE_OT_clear_grid_planes,
     PERSPECTIVE_OT_clear_type_guides_splines,
     PERSPECTIVE_OT_clear_just_guides,
     PERSPECTIVE_OT_clear_horizon_spline,
@@ -4366,6 +4530,10 @@ classes_splines = (
     VIEW3D_PT_rogue_perspective_trimmer,
     VIEW3D_PT_perspective_extraction,
 )
+
+#
+# ------------------  END: Fully Updated classes_splines Tuple  ------------------
+#
 
 
 def register():
