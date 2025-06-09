@@ -1217,6 +1217,160 @@ class PerspectiveToolSettingsSplines(PropertyGroup):
 
 # MAKE SURE 'get_guides_collection' and HORIZON_CURVE_OBJ_NAME are defined before this point.
 
+# --- Place these in your Operators section, replacing the stubs ---
+
+class PERSPECTIVE_OT_generate_3p_h1_lines(bpy.types.Operator):
+    bl_idname = "perspective_splines.generate_3p_h1_lines"
+    bl_label = "Generate 3P H1 Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        # Ensure VPs exist
+        PERSPECTIVE_OT_create_3p_vps_if_needed.create_default_three_point_vps(context)
+        vps = get_vanishing_points('THREE_POINT_H')
+        if not vps or len(vps) < 1:
+            self.report({'ERROR'}, "3P H1 VP not found. Create VPs first.")
+            return {'CANCELLED'}
+        vp = vps[0]  # H1 is the first horizontal VP
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["3P_Guides_H1_"])
+        ext = ts.three_point_line_extension
+        density = ts.three_point_vp_h1_density
+
+        lines_data = generate_radial_lines_in_plane(vp.location.copy(), density, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No H1 lines to generate.")
+            return {'FINISHED'}
+
+        opac = ts.guide_curves_opacity
+        thickness = ts.guide_curves_thickness
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"3P_Guides_H1_{i+1}", [pts_list], guides_coll, thickness, opac):
+                created_count += 1
+        self.report({'INFO'}, f"Generated {created_count} 3P H1 lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+
+class PERSPECTIVE_OT_generate_3p_h2_lines(bpy.types.Operator):
+    bl_idname = "perspective_splines.generate_3p_h2_lines"
+    bl_label = "Generate 3P H2 Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        PERSPECTIVE_OT_create_3p_vps_if_needed.create_default_three_point_vps(context)
+        vps = get_vanishing_points('THREE_POINT_H')
+        if not vps or len(vps) < 2:
+            self.report({'ERROR'}, "3P H2 VP not found. Create VPs first.")
+            return {'CANCELLED'}
+        vp = vps[1]  # H2 is the second horizontal VP
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["3P_Guides_H2_"])
+        ext = ts.three_point_line_extension
+        density = ts.three_point_vp_h2_density
+
+        lines_data = generate_radial_lines_in_plane(vp.location.copy(), density, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No H2 lines to generate.")
+            return {'FINISHED'}
+
+        opac = ts.guide_curves_opacity
+        thickness = ts.guide_curves_thickness
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"3P_Guides_H2_{i+1}", [pts_list], guides_coll, thickness, opac):
+                created_count += 1
+        self.report({'INFO'}, f"Generated {created_count} 3P H2 lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+
+class PERSPECTIVE_OT_generate_3p_v_lines(bpy.types.Operator):
+    bl_idname = "perspective_splines.generate_3p_v_lines"
+    bl_label = "Generate 3P V Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        PERSPECTIVE_OT_create_3p_vps_if_needed.create_default_three_point_vps(context)
+        vps = get_vanishing_points('THREE_POINT_V')
+        if not vps or len(vps) < 1:
+            self.report({'ERROR'}, "3P V VP not found. Create VPs first.")
+            return {'CANCELLED'}
+        vp = vps[0]  # V is the vertical VP
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["3P_Guides_V_"])
+        ext = ts.three_point_line_extension
+        density = ts.three_point_vp_v_density
+
+        lines_data = generate_radial_lines_in_plane(vp.location.copy(), density, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No V lines to generate.")
+            return {'FINISHED'}
+
+        opac = ts.guide_curves_opacity
+        thickness = ts.guide_curves_thickness
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"3P_Guides_V_{i+1}", [pts_list], guides_coll, thickness, opac):
+                created_count += 1
+        self.report({'INFO'}, f"Generated {created_count} 3P V lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+
+
+class PERSPECTIVE_OT_create_3p_vps_if_needed(bpy.types.Operator):
+    """Helper to ensure 3P VPs exist, called by specific 3P line generators."""
+    bl_idname = "perspective_splines.create_3p_vps_if_needed"
+    bl_label = "Ensure 3P VPs"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    @classmethod
+    def create_default_three_point_vps(cls, context):
+        ts = context.scene.perspective_tool_settings_splines
+        helpers_coll = get_helpers_collection(context)
+
+        # Get horizon Z from control or fallback to property
+        horizon_z = ts.horizon_y_level
+        horizon_ctrl = get_horizon_control_object()
+        if horizon_ctrl:
+            horizon_z = horizon_ctrl.location.z
+            if abs(ts.horizon_y_level - horizon_z) > 0.001:
+                ts.horizon_y_level = horizon_z
+
+        # Define default locations for the VPs
+        h1_loc = Vector((-10.0, 0.0, horizon_z))
+        h2_loc = Vector((10.0, 0.0, horizon_z))
+        v_loc = Vector((0.0, 0.0, horizon_z + 10.0))
+
+        # Names and colors
+        h1_name = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_H'] + "_1"
+        h2_name = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_H'] + "_2"
+        v_name  = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_V'] + "_1"
+
+        h1_color = ts.three_point_vp_h1_empty_color
+        h2_color = ts.three_point_vp_h2_empty_color
+        v_color  = ts.three_point_vp_v_empty_color
+
+        # Create or update H1
+        add_vp_empty_if_missing(context, h1_name, h1_loc, h1_color)
+        # Create or update H2
+        add_vp_empty_if_missing(context, h2_name, h2_loc, h2_color)
+        # Create or update V
+        add_vp_empty_if_missing(context, v_name, v_loc, v_color)
+
+    def execute(self, context):
+        self.create_default_three_point_vps(context)
+        self.report({'INFO'}, "Ensured 3P VPs.")
+        return {'FINISHED'}
+
 
 class PERSPECTIVE_OT_clip_guides_to_camera(bpy.types.Operator):
     """Clips guide endpoints to the camera borders"""
@@ -4508,11 +4662,10 @@ def perspective_depsgraph_handler_splines(scene, depsgraph):
 # ------------------ START: Fully Updated classes_splines Tuple ------------------
 #
 
-classes_splines = (
-    # --- Property Group ---
-    PerspectiveToolSettingsSplines,
+# ... all your class definitions above ...
 
-    # --- Main Generation and Setup Operators ---
+classes_splines = (
+    PerspectiveToolSettingsSplines,
     PERSPECTIVE_OT_generate_horizon_spline,
     PERSPECTIVE_OT_add_vanishing_point_empty,
     PERSPECTIVE_OT_generate_one_point_splines,
@@ -4525,16 +4678,12 @@ classes_splines = (
     PERSPECTIVE_OT_generate_3p_h2_lines,
     PERSPECTIVE_OT_generate_3p_v_lines,
     PERSPECTIVE_OT_generate_fish_eye_splines,
-    
-    # --- Construction, Clipping, and Alignment ---
     PERSPECTIVE_OT_create_box_grid,
     PERSPECTIVE_OT_align_camera_splines,
     PERSPECTIVE_OT_create_clipping_shape,
     PERSPECTIVE_OT_delete_all_clipping_shapes,
-    PERSPECTIVE_OT_clip_guides_to_camera,       # The restored dedicated camera clipper
-    PERSPECTIVE_OT_clip_guides_custom_shape,    # The new dedicated custom shape clipper
-
-    # --- VP Extraction (from Empties) Operators ---
+    PERSPECTIVE_OT_clip_guides_to_camera,
+    PERSPECTIVE_OT_clip_guides_custom_shape,
     PERSPECTIVE_OT_add_1p_extraction_empties,
     PERSPECTIVE_OT_extract_1p_from_selected_empties,
     PERSPECTIVE_OT_add_2p_vp1_helpers,
@@ -4547,15 +4696,11 @@ classes_splines = (
     PERSPECTIVE_OT_extract_3p_h_vp2_from_empties,
     PERSPECTIVE_OT_add_3p_v_vp_helpers,
     PERSPECTIVE_OT_extract_3p_v_from_empties,
-
-    # --- Helper & Aid Management Operators ---
     PERSPECTIVE_OT_refresh_extraction_aids,
     PERSPECTIVE_OT_toggle_all_helpers,
     PERSPECTIVE_OT_delete_all_helpers,
     PERSPECTIVE_OT_select_helper_empties,
     PERSPECTIVE_OT_remove_selected_helper_empty,
-
-    # --- Clearing, Merging, and Toggling Operators ---
     PERSPECTIVE_OT_clear_grid_planes,
     PERSPECTIVE_OT_clear_type_guides_splines,
     PERSPECTIVE_OT_clear_just_guides,
@@ -4564,18 +4709,11 @@ classes_splines = (
     PERSPECTIVE_OT_merge_specific_guides,
     PERSPECTIVE_OT_merge_guides,
     PERSPECTIVE_OT_toggle_guide_visibility,
-
-    # --- UI Panels ---
     Rogue_Perspective_AI_PT_main,
     VIEW3D_PT_rogue_perspective_grids,
     VIEW3D_PT_rogue_perspective_trimmer,
     VIEW3D_PT_perspective_extraction,
 )
-
-#
-# ------------------  END: Fully Updated classes_splines Tuple  ------------------
-#
-
 
 def register():
     global _depsgraph_handler_active_splines, previous_perspective_type_on_switch
@@ -4590,18 +4728,15 @@ def register():
     except TypeError as e:
         print(f"Warning: perspective_tool_settings_splines already exists on Scene type: {e}")
 
-    # Append the depsgraph handler if not already present
     if perspective_depsgraph_handler_splines not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(perspective_depsgraph_handler_splines)
 
     _depsgraph_handler_active_splines = True
-    # The global previous_perspective_type_on_switch default is already set (typically to 'NONE')
     print("Rogue Perspective AI Registered.")
-
 
 def unregister():
     global _depsgraph_handler_active_splines
-    _depsgraph_handler_active_splines = False  # Disable depsgraph handler
+    _depsgraph_handler_active_splines = False
 
     if perspective_depsgraph_handler_splines in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(perspective_depsgraph_handler_splines)
@@ -4622,9 +4757,7 @@ def unregister():
 
     print("Rogue Perspective AI Unregistered.")
 
-
 if __name__ == "__main__":
-    # Useful for testing inside Blender's text editor: unregister if already registered then register.
     if hasattr(bpy.types, "Rogue_Perspective_AI_PT_main"):
         try:
             unregister()
@@ -4634,5 +4767,4 @@ if __name__ == "__main__":
         register()
     except Exception as e:
         print(f"Error during registration: {e}")
-
 

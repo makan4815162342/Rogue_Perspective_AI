@@ -262,11 +262,11 @@ def refresh_extraction_aid_lines(context, from_selection_change=False):
         return
     ts = context.scene.perspective_tool_settings_splines
     aids_coll = get_extraction_aids_collection(context)
-    
+
     # Always clear any existing aid lines.
     print("DEBUG refresh_aids: Clearing all existing VISUAL aid lines.")
     clear_extraction_aids_lines(context)
-    
+
     if not ts.show_extraction_helper_lines:
         print("DEBUG refresh_aids: Toggle is OFF, no aid lines will be drawn.")
         if context.area:
@@ -275,24 +275,50 @@ def refresh_extraction_aid_lines(context, from_selection_change=False):
 
     # Get all selected empties.
     selected_empties = [obj for obj in context.selected_objects if obj.type == 'EMPTY']
-    
+
     if ts.current_perspective_type == 'ONE_POINT':
         helpers_1p = sorted([e for e in selected_empties if "1P_Aid" in e.name], key=lambda o: o.name)
         if len(helpers_1p) == 4:
             # Assume the first two helpers define one line and the next two the second line.
             e1, e2, e3, e4 = helpers_1p
-            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_1P_A", 
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_1P_A",
                                                 e1.matrix_world.translation, e2.matrix_world.translation, aids_coll)
-            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_1P_B", 
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_1P_B",
                                                 e3.matrix_world.translation, e4.matrix_world.translation, aids_coll)
             print("DEBUG refresh_aids: Drew/Updated 1P aid lines")
         else:
             print("DEBUG refresh_aids: Not exactly 4 '1P_Aid' empties selected for 1P aid lines.")
 
-
+    # --- START OF THE FIX ---
     elif ts.current_perspective_type == 'TWO_POINT':
-        # ... your two-point extraction code ...
-        pass
+        print("DEBUG refresh_aids: In TWO_POINT block")
+
+        # --- Aid Lines for VP1 ---
+        helpers_2p_vp1 = sorted([e for e in selected_empties if "2P_VP1_Aid" in e.name], key=lambda o: o.name)
+        if len(helpers_2p_vp1) == 4:
+            print(f"DEBUG refresh_aids: Drawing 2P_VP1 aid lines for: {[e.name for e in helpers_2p_vp1]}")
+            e1, e2, e3, e4 = helpers_2p_vp1
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_2P_VP1_A",
+                                                   e1.matrix_world.translation, e2.matrix_world.translation, aids_coll)
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_2P_VP1_B",
+                                                   e3.matrix_world.translation, e4.matrix_world.translation, aids_coll)
+            print("DEBUG refresh_aids: Drew/Updated 2P_VP1 aid lines")
+        else:
+            print(f"DEBUG refresh_aids: Not exactly 4 '2P_VP1_Aid' empties selected. Found: {len(helpers_2p_vp1)}")
+
+        # --- Aid Lines for VP2 ---
+        helpers_2p_vp2 = sorted([e for e in selected_empties if "2P_VP2_Aid" in e.name], key=lambda o: o.name)
+        if len(helpers_2p_vp2) == 4:
+            print(f"DEBUG refresh_aids: Drawing 2P_VP2 aid lines for: {[e.name for e in helpers_2p_vp2]}")
+            e1, e2, e3, e4 = helpers_2p_vp2
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_2P_VP2_A",
+                                                   e1.matrix_world.translation, e2.matrix_world.translation, aids_coll)
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_2P_VP2_B",
+                                                   e3.matrix_world.translation, e4.matrix_world.translation, aids_coll)
+            print("DEBUG refresh_aids: Drew/Updated 2P_VP2 aid lines")
+        else:
+            print(f"DEBUG refresh_aids: Not exactly 4 '2P_VP2_Aid' empties selected. Found: {len(helpers_2p_vp2)}")
+    # --- END OF THE FIX ---
 
     elif ts.current_perspective_type == 'THREE_POINT':
         print("DEBUG refresh_aids: In THREE_POINT block")
@@ -302,9 +328,9 @@ def refresh_extraction_aid_lines(context, from_selection_change=False):
         if len(helpers_3p_hvp1) == 4:
             print(f"DEBUG refresh_aids: Drawing 3P_H1 aid lines for: {[e.name for e in helpers_3p_hvp1]}")
             e1, e2, e3, e4 = helpers_3p_hvp1[0], helpers_3p_hvp1[1], helpers_3p_hvp1[2], helpers_3p_hvp1[3]
-            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_H1_A", 
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_H1_A",
                                                    e1.matrix_world.translation, e2.matrix_world.translation, aids_coll)
-            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_H1_B", 
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_H1_B",
                                                    e3.matrix_world.translation, e4.matrix_world.translation, aids_coll)
             print("DEBUG refresh_aids: Drew/Updated 3P_H1 aid lines")
         else:
@@ -315,9 +341,9 @@ def refresh_extraction_aid_lines(context, from_selection_change=False):
         if len(helpers_3p_hvp2) == 4:
             print(f"DEBUG refresh_aids: Drawing 3P_H2 aid lines for: {[e.name for e in helpers_3p_hvp2]}")
             e1, e2, e3, e4 = helpers_3p_hvp2[0], helpers_3p_hvp2[1], helpers_3p_hvp2[2], helpers_3p_hvp2[3]
-            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_H2_A", 
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_H2_A",
                                                    e1.matrix_world.translation, e2.matrix_world.translation, aids_coll)
-            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_H2_B", 
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_H2_B",
                                                    e3.matrix_world.translation, e4.matrix_world.translation, aids_coll)
             print("DEBUG refresh_aids: Drew/Updated 3P_H2 aid lines")
         else:
@@ -328,9 +354,9 @@ def refresh_extraction_aid_lines(context, from_selection_change=False):
         if len(helpers_3p_vvp) == 4:
             print(f"DEBUG refresh_aids: Drawing 3P_V aid lines for: {[e.name for e in helpers_3p_vvp]}")
             e1, e2, e3, e4 = helpers_3p_vvp[0], helpers_3p_vvp[1], helpers_3p_vvp[2], helpers_3p_vvp[3]
-            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_V_A", 
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_V_A",
                                                    e1.matrix_world.translation, e2.matrix_world.translation, aids_coll)
-            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_V_B", 
+            create_or_update_extraction_aid_line(context, "VISUAL_Extraction_Line_3P_V_B",
                                                    e3.matrix_world.translation, e4.matrix_world.translation, aids_coll)
             print("DEBUG refresh_aids: Drew/Updated 3P_V aid lines")
         else:
@@ -1190,6 +1216,160 @@ class PerspectiveToolSettingsSplines(PropertyGroup):
 # ... (Keep all your existing code before the operators, including bl_info, utility functions, properties, etc.) ...
 
 # MAKE SURE 'get_guides_collection' and HORIZON_CURVE_OBJ_NAME are defined before this point.
+
+# --- Place these in your Operators section, replacing the stubs ---
+
+class PERSPECTIVE_OT_generate_3p_h1_lines(bpy.types.Operator):
+    bl_idname = "perspective_splines.generate_3p_h1_lines"
+    bl_label = "Generate 3P H1 Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        # Ensure VPs exist
+        PERSPECTIVE_OT_create_3p_vps_if_needed.create_default_three_point_vps(context)
+        vps = get_vanishing_points('THREE_POINT_H')
+        if not vps or len(vps) < 1:
+            self.report({'ERROR'}, "3P H1 VP not found. Create VPs first.")
+            return {'CANCELLED'}
+        vp = vps[0]  # H1 is the first horizontal VP
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["3P_Guides_H1_"])
+        ext = ts.three_point_line_extension
+        density = ts.three_point_vp_h1_density
+
+        lines_data = generate_radial_lines_in_plane(vp.location.copy(), density, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No H1 lines to generate.")
+            return {'FINISHED'}
+
+        opac = ts.guide_curves_opacity
+        thickness = ts.guide_curves_thickness
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"3P_Guides_H1_{i+1}", [pts_list], guides_coll, thickness, opac):
+                created_count += 1
+        self.report({'INFO'}, f"Generated {created_count} 3P H1 lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+
+class PERSPECTIVE_OT_generate_3p_h2_lines(bpy.types.Operator):
+    bl_idname = "perspective_splines.generate_3p_h2_lines"
+    bl_label = "Generate 3P H2 Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        PERSPECTIVE_OT_create_3p_vps_if_needed.create_default_three_point_vps(context)
+        vps = get_vanishing_points('THREE_POINT_H')
+        if not vps or len(vps) < 2:
+            self.report({'ERROR'}, "3P H2 VP not found. Create VPs first.")
+            return {'CANCELLED'}
+        vp = vps[1]  # H2 is the second horizontal VP
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["3P_Guides_H2_"])
+        ext = ts.three_point_line_extension
+        density = ts.three_point_vp_h2_density
+
+        lines_data = generate_radial_lines_in_plane(vp.location.copy(), density, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No H2 lines to generate.")
+            return {'FINISHED'}
+
+        opac = ts.guide_curves_opacity
+        thickness = ts.guide_curves_thickness
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"3P_Guides_H2_{i+1}", [pts_list], guides_coll, thickness, opac):
+                created_count += 1
+        self.report({'INFO'}, f"Generated {created_count} 3P H2 lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+
+class PERSPECTIVE_OT_generate_3p_v_lines(bpy.types.Operator):
+    bl_idname = "perspective_splines.generate_3p_v_lines"
+    bl_label = "Generate 3P V Lines"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ts = context.scene.perspective_tool_settings_splines
+        PERSPECTIVE_OT_create_3p_vps_if_needed.create_default_three_point_vps(context)
+        vps = get_vanishing_points('THREE_POINT_V')
+        if not vps or len(vps) < 1:
+            self.report({'ERROR'}, "3P V VP not found. Create VPs first.")
+            return {'CANCELLED'}
+        vp = vps[0]  # V is the vertical VP
+
+        guides_coll = get_guides_collection(context)
+        clear_guides_with_prefix(context, ["3P_Guides_V_"])
+        ext = ts.three_point_line_extension
+        density = ts.three_point_vp_v_density
+
+        lines_data = generate_radial_lines_in_plane(vp.location.copy(), density, ext, 'XZ')
+        if not lines_data:
+            self.report({'INFO'}, "No V lines to generate.")
+            return {'FINISHED'}
+
+        opac = ts.guide_curves_opacity
+        thickness = ts.guide_curves_thickness
+        created_count = 0
+        for i, pts_list in enumerate(lines_data):
+            if create_curve_object(context, f"3P_Guides_V_{i+1}", [pts_list], guides_coll, thickness, opac):
+                created_count += 1
+        self.report({'INFO'}, f"Generated {created_count} 3P V lines.")
+        update_dynamic_horizon_line_curve(context)
+        return {'FINISHED'}
+
+
+
+class PERSPECTIVE_OT_create_3p_vps_if_needed(bpy.types.Operator):
+    """Helper to ensure 3P VPs exist, called by specific 3P line generators."""
+    bl_idname = "perspective_splines.create_3p_vps_if_needed"
+    bl_label = "Ensure 3P VPs"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    @classmethod
+    def create_default_three_point_vps(cls, context):
+        ts = context.scene.perspective_tool_settings_splines
+        helpers_coll = get_helpers_collection(context)
+
+        # Get horizon Z from control or fallback to property
+        horizon_z = ts.horizon_y_level
+        horizon_ctrl = get_horizon_control_object()
+        if horizon_ctrl:
+            horizon_z = horizon_ctrl.location.z
+            if abs(ts.horizon_y_level - horizon_z) > 0.001:
+                ts.horizon_y_level = horizon_z
+
+        # Define default locations for the VPs
+        h1_loc = Vector((-10.0, 0.0, horizon_z))
+        h2_loc = Vector((10.0, 0.0, horizon_z))
+        v_loc = Vector((0.0, 0.0, horizon_z + 10.0))
+
+        # Names and colors
+        h1_name = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_H'] + "_1"
+        h2_name = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_H'] + "_2"
+        v_name  = VP_TYPE_SPECIFIC_PREFIX_MAP['THREE_POINT_V'] + "_1"
+
+        h1_color = ts.three_point_vp_h1_empty_color
+        h2_color = ts.three_point_vp_h2_empty_color
+        v_color  = ts.three_point_vp_v_empty_color
+
+        # Create or update H1
+        add_vp_empty_if_missing(context, h1_name, h1_loc, h1_color)
+        # Create or update H2
+        add_vp_empty_if_missing(context, h2_name, h2_loc, h2_color)
+        # Create or update V
+        add_vp_empty_if_missing(context, v_name, v_loc, v_color)
+
+    def execute(self, context):
+        self.create_default_three_point_vps(context)
+        self.report({'INFO'}, "Ensured 3P VPs.")
+        return {'FINISHED'}
 
 
 class PERSPECTIVE_OT_clip_guides_to_camera(bpy.types.Operator):
@@ -3491,10 +3671,10 @@ class PERSPECTIVE_OT_generate_fish_eye_splines(Operator):
         front_only = getattr(ts, "fish_eye_front_only", True)
         draw_1p = getattr(ts, "fish_eye_draw_1p", True)
 
-        # 1. Main sphere now uses a fixed default rotation.
+        # Main sphere uses a fixed default rotation.
         rot_euler = Euler((math.radians(90.0), math.radians(90.0), 0.0), 'XYZ')
 
-        # 2. Get the new user-controlled orientation for the 1P grid.
+        # Get the new user-controlled orientation for the 1P grid.
         rot_1p_x = math.radians(getattr(ts, "one_point_orientation_x", 90.0))
         rot_1p_y = math.radians(getattr(ts, "one_point_orientation_y", 90.0))
         rot_1p_z = math.radians(getattr(ts, "one_point_orientation_z", 0.0))
@@ -3502,7 +3682,7 @@ class PERSPECTIVE_OT_generate_fish_eye_splines(Operator):
 
         curves_data_to_create = []
 
-        # --- Generate longitude and latitude lines ---
+        # --- Generate longitude lines (meridians) ---
         if n_lon > 0 and segs > 1:
             for i in range(n_lon):
                 phi = (2 * math.pi * i) / n_lon
@@ -3514,38 +3694,54 @@ class PERSPECTIVE_OT_generate_fish_eye_splines(Operator):
                     z = radius * math.sin(theta) * math.sin(phi)
                     pt = Vector((x, y, z))
                     pt_rot = pt.copy()
-                    pt_rot.rotate(rot_euler) # Apply fixed sphere rotation
+                    pt_rot.rotate(rot_euler)
                     if front_only and pt_rot.y > 0:
                         continue
                     pts_longitude.append(center_loc + pt_rot)
                 if len(pts_longitude) > 1:
                     curves_data_to_create.append({'points_list': [pts_longitude], 'is_cyclic': False, 'name_suffix': f"Lon_{i}"})
 
+        # --- Generate latitude lines (parallels) ---
+        # --- START OF FINAL FIX ---
         if ts.fish_eye_draw_latitude and n_lat > 0 and segs > 1:
             for i in range(1, n_lat + 1):
                 theta = math.pi * i / (n_lat + 1)
                 ring_radius = radius * math.sin(theta)
-                x = radius * math.cos(theta)
-                pt_lat = Vector((x, 0, 0))
-                pt_lat_rot = pt_lat.copy()
-                pt_lat_rot.rotate(rot_euler) # Apply fixed sphere rotation
-                if front_only and pt_lat_rot.y > 0:
-                    continue
+                x_offset = radius * math.cos(theta)
+
                 pts_latitude = []
+                # First, generate ALL the points for a full circle.
                 for j in range(segs + 1):
                     phi = (2 * math.pi * j) / segs
                     y = ring_radius * math.cos(phi) * h_scale
                     z = ring_radius * math.sin(phi)
-                    pt = Vector((x, y, z))
+                    pt = Vector((x_offset, y, z))
+
+                    # Rotate the point into its final position.
                     pt_rot = pt.copy()
-                    pt_rot.rotate(rot_euler) # Apply fixed sphere rotation
+                    pt_rot.rotate(rot_euler)
+
+                    # NOW, check if it should be included. This logic is now
+                    # identical to the longitude cutting logic.
                     if front_only and pt_rot.y > 0:
                         continue
+
                     pts_latitude.append(center_loc + pt_rot)
+
+                # After building the list of valid points, create the curve.
                 if len(pts_latitude) > 1:
-                    curves_data_to_create.append({'points_list': [pts_latitude], 'is_cyclic': True, 'name_suffix': f"Lat_{i}"})
+                    # The curve is ONLY cyclic if we are NOT in "Front Only" mode.
+                    # This prevents the ugly line across the gap.
+                    is_line_cyclic = not front_only
+                    curves_data_to_create.append({
+                        'points_list': [pts_latitude],
+                        'is_cyclic': is_line_cyclic,
+                        'name_suffix': f"Lat_{i}"
+                    })
+        # --- END OF FINAL FIX ---
 
         if draw_1p:
+            # This boundary should also be cut if front_only is active.
             theta = math.pi / 2
             ring_radius = radius * math.sin(theta)
             x = radius * math.cos(theta)
@@ -3556,29 +3752,28 @@ class PERSPECTIVE_OT_generate_fish_eye_splines(Operator):
                 z = ring_radius * math.sin(phi)
                 pt = Vector((x, y, z))
                 pt_rot = pt.copy()
-                pt_rot.rotate(rot_euler) # Apply fixed sphere rotation
+                pt_rot.rotate(rot_euler)
+                if front_only and pt_rot.y > 0:
+                    continue
                 pts_equator.append(center_loc + pt_rot)
             if len(pts_equator) > 1:
-                curves_data_to_create.append({'points_list': [pts_equator], 'is_cyclic': True, 'name_suffix': "1P_Boundary"})
+                curves_data_to_create.append({
+                    'points_list': [pts_equator],
+                    'is_cyclic': not front_only, # Also make this non-cyclic when cut
+                    'name_suffix': "1P_Boundary"
+                })
 
-        # --- 1P radial lines with new user-controlled orientation ---
         one_point_density = getattr(ts, "one_point_grid_density_radial", 16)
-        one_point_length = radius
+        line_length_factor = getattr(ts, "one_point_line_length_factor", 1.0)
+        one_point_length = radius * line_length_factor
         if draw_1p and one_point_density > 0:
             for i in range(one_point_density):
                 angle = 2 * math.pi * i / one_point_density
                 pt_start = Vector((0, 0, 0))
-
-                # Create the base grid flat on the XY plane.
                 pt_end = Vector((one_point_length * math.cos(angle) * h_scale, one_point_length * math.sin(angle), 0.0))
-
-                pt_start_rot = pt_start.copy()
-                pt_end_rot = pt_end.copy()
-
-                # Apply the new user-controlled rotation for the 1P grid.
+                pt_start_rot, pt_end_rot = pt_start.copy(), pt_end.copy()
                 pt_start_rot.rotate(one_point_rot_euler)
                 pt_end_rot.rotate(one_point_rot_euler)
-
                 curves_data_to_create.append({
                     'points_list': [[center_loc + pt_start_rot, center_loc + pt_end_rot]],
                     'is_cyclic': False,
@@ -4467,11 +4662,10 @@ def perspective_depsgraph_handler_splines(scene, depsgraph):
 # ------------------ START: Fully Updated classes_splines Tuple ------------------
 #
 
-classes_splines = (
-    # --- Property Group ---
-    PerspectiveToolSettingsSplines,
+# ... all your class definitions above ...
 
-    # --- Main Generation and Setup Operators ---
+classes_splines = (
+    PerspectiveToolSettingsSplines,
     PERSPECTIVE_OT_generate_horizon_spline,
     PERSPECTIVE_OT_add_vanishing_point_empty,
     PERSPECTIVE_OT_generate_one_point_splines,
@@ -4484,16 +4678,12 @@ classes_splines = (
     PERSPECTIVE_OT_generate_3p_h2_lines,
     PERSPECTIVE_OT_generate_3p_v_lines,
     PERSPECTIVE_OT_generate_fish_eye_splines,
-    
-    # --- Construction, Clipping, and Alignment ---
     PERSPECTIVE_OT_create_box_grid,
     PERSPECTIVE_OT_align_camera_splines,
     PERSPECTIVE_OT_create_clipping_shape,
     PERSPECTIVE_OT_delete_all_clipping_shapes,
-    PERSPECTIVE_OT_clip_guides_to_camera,       # The restored dedicated camera clipper
-    PERSPECTIVE_OT_clip_guides_custom_shape,    # The new dedicated custom shape clipper
-
-    # --- VP Extraction (from Empties) Operators ---
+    PERSPECTIVE_OT_clip_guides_to_camera,
+    PERSPECTIVE_OT_clip_guides_custom_shape,
     PERSPECTIVE_OT_add_1p_extraction_empties,
     PERSPECTIVE_OT_extract_1p_from_selected_empties,
     PERSPECTIVE_OT_add_2p_vp1_helpers,
@@ -4506,15 +4696,11 @@ classes_splines = (
     PERSPECTIVE_OT_extract_3p_h_vp2_from_empties,
     PERSPECTIVE_OT_add_3p_v_vp_helpers,
     PERSPECTIVE_OT_extract_3p_v_from_empties,
-
-    # --- Helper & Aid Management Operators ---
     PERSPECTIVE_OT_refresh_extraction_aids,
     PERSPECTIVE_OT_toggle_all_helpers,
     PERSPECTIVE_OT_delete_all_helpers,
     PERSPECTIVE_OT_select_helper_empties,
     PERSPECTIVE_OT_remove_selected_helper_empty,
-
-    # --- Clearing, Merging, and Toggling Operators ---
     PERSPECTIVE_OT_clear_grid_planes,
     PERSPECTIVE_OT_clear_type_guides_splines,
     PERSPECTIVE_OT_clear_just_guides,
@@ -4523,18 +4709,11 @@ classes_splines = (
     PERSPECTIVE_OT_merge_specific_guides,
     PERSPECTIVE_OT_merge_guides,
     PERSPECTIVE_OT_toggle_guide_visibility,
-
-    # --- UI Panels ---
     Rogue_Perspective_AI_PT_main,
     VIEW3D_PT_rogue_perspective_grids,
     VIEW3D_PT_rogue_perspective_trimmer,
     VIEW3D_PT_perspective_extraction,
 )
-
-#
-# ------------------  END: Fully Updated classes_splines Tuple  ------------------
-#
-
 
 def register():
     global _depsgraph_handler_active_splines, previous_perspective_type_on_switch
@@ -4549,18 +4728,15 @@ def register():
     except TypeError as e:
         print(f"Warning: perspective_tool_settings_splines already exists on Scene type: {e}")
 
-    # Append the depsgraph handler if not already present
     if perspective_depsgraph_handler_splines not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(perspective_depsgraph_handler_splines)
 
     _depsgraph_handler_active_splines = True
-    # The global previous_perspective_type_on_switch default is already set (typically to 'NONE')
     print("Rogue Perspective AI Registered.")
-
 
 def unregister():
     global _depsgraph_handler_active_splines
-    _depsgraph_handler_active_splines = False  # Disable depsgraph handler
+    _depsgraph_handler_active_splines = False
 
     if perspective_depsgraph_handler_splines in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(perspective_depsgraph_handler_splines)
@@ -4581,9 +4757,7 @@ def unregister():
 
     print("Rogue Perspective AI Unregistered.")
 
-
 if __name__ == "__main__":
-    # Useful for testing inside Blender's text editor: unregister if already registered then register.
     if hasattr(bpy.types, "Rogue_Perspective_AI_PT_main"):
         try:
             unregister()
@@ -4593,5 +4767,4 @@ if __name__ == "__main__":
         register()
     except Exception as e:
         print(f"Error during registration: {e}")
-
 
