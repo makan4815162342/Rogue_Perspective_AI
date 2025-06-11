@@ -1,3 +1,20 @@
+#Rogue_Perspective_AI
+
+#Rogue Perspective AI is an Add-On made with Vibe Coding for Blender by Makan Ansari, using Google Studio and Bing AI and Microsoft Copilot AI.
+
+#This Add-On covers almost all of the Perspectives that artists need for their drawings and paintings!
+
+#It's open source under GPL V.3
+
+#Email: mk.3dartist@gmail.com
+
+#Twitter(X): https://x.com/MakanAnsariCG
+
+#Links: https://t.co/jlzFNv9ktS
+
+#GitHub: https://github.com/makan4815162342/Rogue_Perspective_AI.git
+
+
 import bpy
 from bpy.props import (
     PointerProperty, StringProperty, FloatProperty,
@@ -1007,13 +1024,6 @@ def switch_perspective_type_prop(self, context): # self is PerspectiveToolSettin
 # ------------------ START: Fully Updated PerspectiveToolSettingsSplines Class ------------------
 #
 
-#
-# ------------------ START: Fully Updated PerspectiveToolSettingsSplines Class ------------------
-#
-
-#
-# ------------------ START: Fully Updated PerspectiveToolSettingsSplines Class ------------------
-#
 
 class PerspectiveToolSettingsSplines(PropertyGroup):
 
@@ -1198,14 +1208,6 @@ class PerspectiveToolSettingsSplines(PropertyGroup):
 #
 # ------------------  END: Fully Updated PerspectiveToolSettingsSplines Class  ------------------
 #
-#
-# ------------------  END: Fully Updated PerspectiveToolSettingsSplines Class  ------------------
-#
-    
-#
-# ------------------  END: Fully Updated PerspectiveToolSettingsSplines Class  ------------------
-#
-
 # -----------------------------------------------------------
 # Helper: Add Vanishing Point Empty if Missing
 # -----------------------------------------------------------
