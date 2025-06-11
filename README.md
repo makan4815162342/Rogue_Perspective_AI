@@ -1,4 +1,5 @@
-![Copilot_20250611_024601](https://github.com/user-attachments/assets/facdbf89-2042-4ac6-821b-bea39c596ee6)
+![Rogue AI Cover](https://github.com/user-attachments/assets/5722dbfa-5e78-4352-a9e3-32fc0186d6df)
+
 
 Rogue_Perspective_AI 
 
