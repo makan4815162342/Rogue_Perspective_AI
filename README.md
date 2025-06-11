@@ -1,5 +1,6 @@
 ![Rogue AI Cover](https://github.com/user-attachments/assets/5722dbfa-5e78-4352-a9e3-32fc0186d6df)
 
+https://youtu.be/UkMcoD_Qb9c?si=Q4-w_WzJv8VdG3AU
 
 Rogue_Perspective_AI 
 
